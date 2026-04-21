@@ -21,7 +21,7 @@ Do not rewrite the design doc unless the user asks. If a design decision turns o
 ## Status
 
 - **Last completed phase:** Phase 4 — Inbound path (T4.1 through T4.4)
-- **Next phase:** Phase 5 — Outbound attachments & formatting (T5.1 through T5.5)
+- **Next phase:** Phase 5 — Outbound attachments & formatting (T5.0 through T5.5). **T5.0 is a Phase-4-shortcoming #1 fix folded in as a prerequisite** — see the "Fold-in justification" note at the top of Phase 5 below.
 - **Branch:** `nats-gateway` (feature branch; PR target is `main`)
 - **Known blockers:** none
 - **Open design questions pending user input:** 4 items listed in §16 of `docs/nats-gateway-design.md`. Default answers are noted there; proceed with defaults unless the user redirects.
@@ -69,11 +69,18 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 
 ### Phase 5 — Outbound attachments & formatting
 
-- [ ] **T5.1** — Implement `send_image_file` (`Attachment.from_path(path)` → `stream.send(ResponseChunk(text=caption, attachments=[...]))`)
+**Fold-in justification (T5.0).** Phase 4's "known shortcoming #1" — concurrent prompts on the same `x-session` overwrite `_active_streams[chat_id]` so tool outputs from handler A can land on handler B's reply subject — was deliberately deferred at Phase 4's close. Phase 5 adds four new tool-accessible methods (`send_image_file` / `send_document` / `send_voice` / `send_video`) that all resolve through `_active_streams[chat_id]`, so the blast radius of the race quadruples in this phase. Fixing it here (before the send helpers) costs less than retrofitting later — build the send helpers on a race-safe lookup rather than patching four call sites after the fact.
+
+- [ ] **T5.0** — Race-safe stream lookup. Options (pick one during implementation):
+  * **(a) Pass-through:** plumb the handler's own `PromptStream` into tool calls via a contextvar / `asyncio.TaskGroup`-scoped state, so each tool fires on *its* handler's stream regardless of `_active_streams` state. Cleanest but touches the tool dispatch surface.
+  * **(b) Compound key:** key `_active_streams` by `(chat_id, stream_id)` (e.g. id of the PromptStream object) and have send helpers look up through the caller's captured handler context rather than chat_id alone.
+  * **(c) Per-chat_id stack:** `_active_streams[chat_id]` becomes a `list[PromptStream]`; `_on_prompt` pushes on entry, pops on exit, send helpers use the top-of-stack. Simplest change but LIFO semantics are wrong for legitimate concurrent sessions — second handler's sends would go to the first stream until the first exits. Reject unless (a)/(b) prove too invasive.
+  * **Recommendation:** start with (b). The other two are heavier lifts; (b) is a 2-line dict shape change + one call-site update per send helper.
+- [ ] **T5.1** — Implement `send_image_file` (`Attachment.from_path(path)` → `stream.send(ResponseChunk(text=caption, attachments=[...]))`), built on the T5.0 race-safe lookup.
 - [ ] **T5.2** — Implement `send_document` (same pattern, generic file)
 - [ ] **T5.3** — Implement `send_voice` / `send_video` (same pattern; v0.1 doesn't distinguish on wire)
-- [ ] **T5.4** — `format_message()` override (no-op for symmetry — NATS carries text verbatim)
-- [ ] **T5.5** — `tests/gateway/test_nats_outbound.py` — image/doc/voice → ResponseChunk.attachments[0] shape
+- [ ] **T5.4** — `format_message()` override (no-op for symmetry — NATS carries text verbatim; already landed in Phase 4 as a class method, but confirm it's wired into the same call paths Phase 5 uses)
+- [ ] **T5.5** — `tests/gateway/test_nats_outbound.py` — image/doc/voice → ResponseChunk.attachments[0] shape, **plus a concurrent-x-session regression test**: two overlapping `_on_prompt` invocations with the same chat_id, each firing a send helper, must land on their own streams respectively (this is the T5.0 regression guard and belongs in the outbound test file because the send helpers are where the race becomes observable).
 
 ### Phase 6 — Mid-stream queries (NATS-local)
 
@@ -245,7 +252,7 @@ Surfaced during Phase 4 self-review. `_looks_like_command` tolerates leading whi
 
 Each of these is a deliberate MVP trade-off that should either land in a later phase or be promoted to a design-doc non-goal. Logged here so future Claudes don't waste cycles rediscovering them as "bugs".
 
-1. **Concurrent prompts on the same `x-session` overwrite `_active_streams[chat_id]`.** Two prompts with the same `x-session` arriving in quick succession race — the second replaces the first in `_active_streams`, so tool outputs from the first handler (e.g., `send_image_file`) land on the second handler's reply subject. The finally-block guards against popping the wrong key on cleanup (`current is stream`) but that only protects exit; it doesn't protect the mid-handler mis-route. Acceptable for MVP because the typical caller pattern is one concurrent request per session; a production-grade fix would key `_active_streams` by `(chat_id, stream_instance)` or maintain a per-chat_id stack. Should get a test + fix in Phase 5 or 6.
+1. **Concurrent prompts on the same `x-session` overwrite `_active_streams[chat_id]`.** Two prompts with the same `x-session` arriving in quick succession race — the second replaces the first in `_active_streams`, so tool outputs from the first handler (e.g., `send_image_file`) land on the second handler's reply subject. The finally-block guards against popping the wrong key on cleanup (`current is stream`) but that only protects exit; it doesn't protect the mid-handler mis-route. **Status: SCHEDULED for Phase 5 as T5.0** (folded in as a prerequisite because the four new `send_*` tool methods quadruple the blast radius). See Phase 5's "Fold-in justification" note above for implementation options (a/b/c).
 
 2. **`/stop` cannot interrupt a running NATS agent.** We bypass `self.handle_message(event)` for text prompts (design doc §6.1, api_server-style agent ownership), so `_active_sessions[session_key]` in `BasePlatformAdapter` is never populated. The gateway's `/stop` handler walks `_active_sessions` to find a running agent — for NATS that dict is always empty, so `/stop` becomes a no-op. Callers can drop their NATS subscription to abandon a run; real interrupt support would require either (a) routing text through `handle_message` and adding a NATS-aware stream consumer, or (b) adapter-local active-session tracking that the `/stop` handler is taught to consult. Defer to post-MVP.
 
@@ -283,11 +290,12 @@ If `TaskList` is empty after a context clear and you need to recreate the tasks,
 | T4.2   | T4.2 — Wire _active_streams into send()                                 | Wiring _active_streams into send        |
 | T4.3   | T4.3 — Wire streaming deltas                                            | Wiring NATS streaming deltas            |
 | T4.4   | T4.4 — Tests for inbound path                                           | Testing NATS inbound path               |
+| T5.0   | T5.0 — Race-safe `_active_streams` lookup (folded-in Phase 4 shortcoming) | Making NATS stream lookup race-safe     |
 | T5.1   | T5.1 — Implement send_image_file                                        | Implementing send_image_file            |
 | T5.2   | T5.2 — Implement send_document                                          | Implementing send_document              |
 | T5.3   | T5.3 — Implement send_voice / send_video                                | Implementing send_voice/send_video      |
 | T5.4   | T5.4 — format_message override (likely no-op)                           | Overriding format_message               |
-| T5.5   | T5.5 — Tests for outbound attachments                                   | Testing NATS outbound attachments       |
+| T5.5   | T5.5 — Tests for outbound attachments + concurrent-x-session regression | Testing NATS outbound attachments       |
 | T6.1   | T6.1 — Survey _pending_approvals usage                                  | Surveying _pending_approvals usage      |
 | T6.2   | T6.2 — Add adapter-side query hook method                               | Adding request_interaction hook         |
 | T6.3   | T6.3 — Wire approval callbacks to adapter.request_interaction           | Wiring approval callbacks               |
