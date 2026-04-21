@@ -344,13 +344,29 @@ class NatsAdapter(BasePlatformAdapter):
 
     # ------------------------------------------------------------------
     # Abstract methods — Phase 2 stubs. Real implementations in Phase 3+.
+    #
+    # Stubs intentionally fail *gracefully* rather than raising: the
+    # gateway's connect_all() loop (gateway/run.py:2076) treats
+    # ``connect() returning False + has_fatal_error + retryable=False``
+    # as a permanent-fatal state and won't schedule 30-s reconnect
+    # attempts, so a partially-landed NATS integration doesn't spam
+    # the gateway log until Phase 3 ships.
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:  # pragma: no cover — Phase 3
-        raise NotImplementedError("NATS connect() lands in Phase 3")
+    async def connect(self) -> bool:
+        self._set_fatal_error(
+            "nats_not_implemented",
+            "NATS adapter connect() is not yet implemented "
+            "(Phase 3 — see docs/nats-gateway-progress.md)",
+            retryable=False,
+        )
+        return False
 
-    async def disconnect(self) -> None:  # pragma: no cover — Phase 3
-        raise NotImplementedError("NATS disconnect() lands in Phase 3")
+    async def disconnect(self) -> None:
+        # Idempotent no-op. Safe to call before Phase 3 lands, and
+        # mirrors the contract Phase 3's real disconnect() will uphold
+        # (no partial state to clean up when connect() never succeeded).
+        return None
 
     async def send(  # pragma: no cover — Phase 4
         self,
@@ -359,7 +375,10 @@ class NatsAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        raise NotImplementedError("NATS send() lands in Phase 4")
+        return SendResult(
+            success=False,
+            error="NATS send() is not yet implemented (Phase 4)",
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         # Phase 3 wires this into the gateway's session machinery; the

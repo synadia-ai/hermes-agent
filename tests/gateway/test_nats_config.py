@@ -370,6 +370,40 @@ class TestNatsAdapterInit:
         info = await adapter.get_chat_info("any-session-id")
         assert info == {"name": "any-session-id", "type": "dm"}
 
+    @pytest.mark.asyncio
+    async def test_connect_stub_fails_nonretryable_until_phase_3(self):
+        # connect() must return False + set a non-retryable fatal error so
+        # gateway/run.py's connect_all loop doesn't schedule 30-s reconnect
+        # attempts against an unimplemented adapter. Matters only for users
+        # running the gateway between phases 2 and 3 with NATS configured.
+        adapter = NatsAdapter(
+            self._pconfig(
+                servers=["nats://x:4222"],
+                owner="rene",
+                name="gateway",
+            )
+        )
+        assert adapter.has_fatal_error is False  # clean after init
+        result = await adapter.connect()
+        assert result is False
+        assert adapter.has_fatal_error is True
+        assert adapter.fatal_error_code == "nats_not_implemented"
+        assert adapter.fatal_error_retryable is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_stub_is_idempotent_no_op(self):
+        adapter = NatsAdapter(
+            self._pconfig(
+                servers=["nats://x:4222"],
+                owner="rene",
+                name="gateway",
+            )
+        )
+        # Must not raise — gateway._safe_adapter_disconnect calls this
+        # defensively after connect() failures.
+        await adapter.disconnect()
+        await adapter.disconnect()  # idempotent
+
 
 # ---------------------------------------------------------------------------
 # Env-variable → config.extra round-trip (complements Phase 1 T1.2)
