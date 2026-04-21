@@ -4339,6 +4339,13 @@ class GatewayRunner:
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.NATS:
+            from gateway.platforms.nats import NatsAdapter, check_nats_requirements
+            if not check_nats_requirements():
+                logger.warning("NATS: natsagent not installed. Run: pip install 'hermes-agent[nats]'")
+                return None
+            return NatsAdapter(config)
+
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """

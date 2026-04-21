@@ -34,7 +34,7 @@ incident.
 import ast
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -215,9 +215,60 @@ def _ensure_discord_mock() -> None:
     sys.modules["discord.ext.commands"] = commands_mod
 
 
+def _ensure_natsagent_mock() -> None:
+    """Install a minimal natsagent mock in sys.modules.
+
+    Idempotent — skips when the real SDK is already imported. Mirrors the
+    Telegram/Discord pattern so gateway tests can import the NATS adapter
+    module without requiring natsagent to be installed.
+    """
+    if "natsagent" in sys.modules and hasattr(sys.modules["natsagent"], "__file__"):
+        return  # Real SDK is installed — nothing to mock
+
+    mod = MagicMock()
+
+    # Top-level connect() factory is awaited in the adapter.
+    mod.connect = AsyncMock()
+
+    # Agent / PromptStream — support `await agent.start()` / `.stop()` usage.
+    mod.Agent = MagicMock()
+    mod.Agent.return_value.start = AsyncMock()
+    mod.Agent.return_value.stop = AsyncMock()
+    mod.PromptStream = MagicMock()
+
+    # Real exception classes so ``except natsagent.QueryTimeout`` works.
+    mod.QueryTimeout = type("QueryTimeout", (Exception,), {})
+    mod.ProtocolError = type("ProtocolError", (Exception,), {})
+
+    # Envelope / Attachment / chunk types — pydantic-ish stand-ins.
+    class _FakeAttachment:
+        def __init__(self, filename: str = "", content: str = ""):
+            self.filename = filename
+            self.content = content
+
+        def to_bytes(self) -> bytes:
+            return b""
+
+        @classmethod
+        def from_path(cls, path):
+            instance = cls(filename=str(path))
+            return instance
+
+        @classmethod
+        def from_bytes(cls, filename, data):
+            return cls(filename=filename)
+
+    mod.Attachment = _FakeAttachment
+    mod.Envelope = MagicMock
+    mod.ResponseChunk = MagicMock
+
+    sys.modules["natsagent"] = mod
+
+
 # Run at collection time — before any test file's module-level imports.
 _ensure_telegram_mock()
 _ensure_discord_mock()
+_ensure_natsagent_mock()
 
 
 # ---------------------------------------------------------------------------
@@ -342,4 +393,3 @@ def pytest_configure(config):
             + "\n\n"
             + _GUARD_HINT
         )
-
