@@ -20,8 +20,8 @@ Do not rewrite the design doc unless the user asks. If a design decision turns o
 
 ## Status
 
-- **Last completed phase:** Phase 1 — Scaffolding & config (T1.1 through T1.6)
-- **Next phase:** Phase 2 — Adapter skeleton (T2.1, T2.2)
+- **Last completed phase:** Phase 2 — Adapter skeleton (T2.1, T2.2)
+- **Next phase:** Phase 3 — Connection & lifecycle (T3.1 through T3.4)
 - **Branch:** `nats-gateway` (feature branch; PR target is `main`)
 - **Known blockers:** none
 - **Open design questions pending user input:** 4 items listed in §16 of `docs/nats-gateway-design.md`. Default answers are noted there; proceed with defaults unless the user redirects.
@@ -50,8 +50,8 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 
 ### Phase 2 — Adapter skeleton
 
-- [ ] **T2.1** — Create `gateway/platforms/nats.py` skeleton (`check_nats_requirements`, `NatsAdapter` stub, `NatsAdapterSettings` dataclass, validation)
-- [ ] **T2.2** — `tests/gateway/test_nats_config.py` — config parsing (happy/bad/env-override)
+- [x] **T2.1** — Create `gateway/platforms/nats.py` skeleton (`check_nats_requirements`, `NatsAdapter` stub, `NatsAdapterSettings` dataclass, validation)
+- [x] **T2.2** — `tests/gateway/test_nats_config.py` — config parsing (happy/bad/env-override)
 
 ### Phase 3 — Connection & lifecycle
 
@@ -122,8 +122,9 @@ Run this every time a phase's tasks are all ticked off. **In order.**
 3. **Tick any remaining `[ ]` boxes** for the just-completed phase. Scan the list for drift vs. TaskList.
 4. **Append to the Decision log** if anything was decided mid-flight (API tweaks, discovered surprises, deferred items).
 5. **Run `TaskList`** and ensure its state matches this file. If divergent, update TaskList — this file is authoritative.
-6. **Report to the user:** "Phase N done. Tests: <passing>. Ready for review / context clear."
-7. **Do not commit, push, or clear context yourself.** Those are user decisions. Wait.
+6. **Commit the phase** on the `nats-gateway` branch. Stage only the files touched by this phase (including this progress doc's updates from steps 2–4). Message format: `feat(gateway): <short phase summary> (phase N)`; body lists what changed and any decisions worth surfacing to a reviewer. Use the standard Claude Code `Co-Authored-By` trailer. Do NOT push and do NOT use `--no-verify`.
+7. **Report to the user:** "Phase N done. Commit: `<short SHA>`. Tests: `<passing>`. Ready for review / context clear."
+8. **Do not push or clear context yourself.** Those remain the user's call.
 
 ---
 
@@ -146,6 +147,22 @@ T1.5 says "add `natsagent` to pyproject.toml extras (and the `all` extra)." The 
 ### 2026-04-21 — Phase 1 — Pre-existing test failures observed, not introduced by Phase 1
 
 `scripts/run_tests.sh tests/gateway/` reports two failures on clean `main` (verified by stashing Phase 1 changes): `test_agent_cache.py::TestAgentCacheIdleResume::test_close_vs_release_full_teardown_difference` and `test_matrix.py::TestMatrixUploadAndSend::test_upload_encrypted_room_uses_file_payload`. These are pre-existing, unrelated to NATS work. Flagged here so a future phase doesn't blame them on NATS changes. `tests/gateway/test_config.py` (the most directly relevant test file) passes cleanly after Phase 1 edits.
+
+### 2026-04-21 — Phase 2 — `max_payload` validated via local regex, not the SDK's `parse_human_bytes`
+
+The design doc §4 calls for pre-flighting `max_payload` through `natsagent._bytes.parse_human_bytes`. The adapter uses a local regex (`_MAX_PAYLOAD_RE`) instead. Reason: the SDK's `_bytes` module is private/underscored, and the gateway test harness installs `natsagent` as a `MagicMock` — `from natsagent._bytes import parse_human_bytes` can't resolve on a MagicMock module, so the check would either crash or no-op silently under test. A local regex matches the §2.1 grammar ("positive integer followed by B/KB/MB/GB") and keeps the validation deterministic whether the real SDK or the mock is loaded. The SDK still re-validates at `Agent(...)` construction time in Phase 3, so this is belt-and-braces rather than belt-only.
+
+### 2026-04-21 — Phase 2 — `agent` token strictly validated; `owner`/`name` deferred to SDK
+
+`NatsAdapterSettings.from_extra` enforces the §2.2 regex (`^[a-z0-9-]+$`) on the `agent` token but only insists on non-empty for `owner` / `name`. Reason: the SDK's `AgentSubject._sanitize()` base64-url-escapes non-conforming owner/name tokens rather than rejecting them, so a strict regex here would reject inputs the SDK would have accepted. The `agent` token has no such fallback — the SDK rejects it outright — so failing fast in our settings parser gives a cleaner error message than the SDK's exception surfacing from inside `connect()`.
+
+### 2026-04-21 — Phase 2 — `bool` rejected for integer fields
+
+Plain `int(True) == 1` would silently pass `heartbeat_interval_s`/`ack_keepalive_interval_s` validation. `_positive_int` rejects `bool` explicitly — a YAML `heartbeat_interval_s: true` is always a mistake, and surfacing it as a config error beats emitting heartbeats every 1 s in production.
+
+### 2026-04-21 — Phase 2 — `_active_streams`/`_nc`/`_agent` initialised on adapter regardless of config validity
+
+Even when `NatsAdapterSettings.from_extra` fails, `NatsAdapter.__init__` initialises `_active_streams = {}`, `_nc = None`, `_agent = None`. Reason: Phase 3's `connect()` and Phase 4's `send()` assume these attributes exist. If a fatal-error adapter somehow reaches later-phase code (e.g. GatewayRunner still calling `get_chat_info()` on it), `AttributeError` would be a harder failure than "not connected". Cheap guard, no downside.
 
 ---
 
