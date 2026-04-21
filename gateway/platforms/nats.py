@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -83,6 +84,23 @@ _AGENT_TOKEN_RE = re.compile(r"^[a-z0-9-]+$")
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".opus"}
 _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
+
+# Handler-scoped current stream. Set by ``_on_prompt`` at entry and reset
+# in its ``finally`` block; read by ``send()`` and the ``send_*`` helpers
+# to reach the caller's own reply subject even when two prompts for the
+# same ``x-session`` overlap.
+#
+# T5.0 (Phase 5) — this is the race-safe primary lookup. ``_active_streams``
+# is kept as a compound-keyed ``(chat_id, id(stream)) → stream`` dict for
+# diagnostics and for the narrow cases where a send is scheduled outside
+# the handler's context (contextvars don't propagate through
+# ``run_coroutine_threadsafe``). Phase 4's shortcoming #1 only manifested
+# on the dict lookup — so once callers prefer the contextvar, concurrent
+# prompts for the same chat_id land on their own streams regardless of
+# dict state.
+_current_stream: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "nats_current_stream", default=None
+)
 
 
 def check_nats_requirements() -> bool:
@@ -358,11 +376,15 @@ class NatsAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig) -> None:
         super().__init__(config, Platform.NATS)
 
-        # Per-chat PromptStream handles. Populated by ``_on_prompt`` on
-        # receipt and consulted by ``send()`` / attachment helpers for
-        # tool-driven outputs that want to land on the caller's reply
-        # subject.
-        self._active_streams: Dict[str, Any] = {}
+        # Compound-keyed handle registry: ``(chat_id, id(stream)) → stream``.
+        # Populated by ``_on_prompt`` on receipt and consulted by
+        # ``send()`` / ``send_*`` helpers. Two prompts arriving with the
+        # same ``x-session`` therefore each land on a distinct key rather
+        # than overwriting each other (Phase 4 shortcoming #1 / T5.0).
+        # The primary per-handler lookup is the ``_current_stream``
+        # contextvar; this dict covers only the rare "send scheduled
+        # outside my handler's context" fallback and diagnostics.
+        self._active_streams: Dict[Tuple[str, int], Any] = {}
         self._nc: Optional[Any] = None
         self._agent: Optional[Any] = None
         self._settings: Optional[NatsAdapterSettings] = None
@@ -617,16 +639,21 @@ class NatsAdapter(BasePlatformAdapter):
 
         chat_id = self._extract_session(stream) or self._session_default()
         keepalive_task: Optional[asyncio.Task] = None
-        stream_registered = False
+        stream_key: Optional[Tuple[str, int]] = None
+
+        # Bind the contextvar BEFORE the try so any send fired from
+        # ``_unpack_envelope`` (attachment error paths) still reaches the
+        # caller's stream; ``_context_token`` is reset unconditionally in
+        # the finally block below.
+        _context_token = _current_stream.set(stream)
 
         try:
             prompt_text, media_urls, media_types, message_type = self._unpack_envelope(envelope)
 
-            # Register the stream BEFORE any I/O so tool outputs fired
-            # from a handler (e.g., an attachment cache error path) can
-            # find the stream to publish onto.
-            self._active_streams[chat_id] = stream
-            stream_registered = True
+            # Register under a compound key so overlapping prompts with
+            # the same ``x-session`` don't overwrite each other.
+            stream_key = (chat_id, id(stream))
+            self._active_streams[stream_key] = stream
 
             source = self.build_source(
                 chat_id=chat_id,
@@ -681,13 +708,13 @@ class NatsAdapter(BasePlatformAdapter):
                 keepalive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await keepalive_task
-            if stream_registered:
-                # Only pop if we registered — guards against popping a
-                # key owned by a different concurrent handler if one
-                # ever raced us on the same chat_id.
-                current = self._active_streams.get(chat_id)
-                if current is stream:
-                    self._active_streams.pop(chat_id, None)
+            if stream_key is not None:
+                # Compound-keyed pop — always safe regardless of which
+                # other handler happens to share the ``chat_id``.
+                self._active_streams.pop(stream_key, None)
+            # Reset contextvar BEFORE discarding the task so any final
+            # callback that runs on this task's context unwinds cleanly.
+            _current_stream.reset(_context_token)
             if task is not None:
                 # ``discard`` (not ``remove``) — ``_teardown_handles`` may
                 # have already called ``clear()`` if cancellation landed
@@ -1080,6 +1107,34 @@ class NatsAdapter(BasePlatformAdapter):
     # Outbound — publish a ResponseChunk on the stream for a given chat_id
     # ------------------------------------------------------------------
 
+    def _resolve_stream(self, chat_id: str) -> Optional[Any]:
+        """Return the PromptStream that ``chat_id`` should publish onto.
+
+        Lookup order (T5.0):
+          1. ``_current_stream`` contextvar — set by ``_on_prompt`` and
+             inherited by every coroutine / executor thread spawned from
+             that handler (``run_in_executor`` and ``asyncio.Task``
+             default-copy the parent's context). This is the race-safe
+             path: two concurrent prompts for the same ``x-session`` each
+             see their own handler's stream here regardless of which
+             overwrote the other in ``_active_streams``.
+          2. ``_active_streams`` compound-key lookup by ``chat_id`` — the
+             fallback for the narrow case where a send is scheduled
+             outside the handler's context (e.g. via
+             ``asyncio.run_coroutine_threadsafe`` from a worker thread
+             whose context didn't propagate). Returns whichever stream
+             happens to be registered first; ambiguous under concurrent
+             same-``chat_id`` prompts, but the contextvar path handles
+             those before this fallback runs.
+        """
+        ctx_stream = _current_stream.get()
+        if ctx_stream is not None:
+            return ctx_stream
+        for (cid, _sid), stream in self._active_streams.items():
+            if cid == chat_id:
+                return stream
+        return None
+
     async def send(
         self,
         chat_id: str,
@@ -1097,7 +1152,7 @@ class NatsAdapter(BasePlatformAdapter):
         surfaces logic bugs (tool firing after handler exit) instead of
         burying them.
         """
-        stream = self._active_streams.get(chat_id)
+        stream = self._resolve_stream(chat_id)
         if stream is None:
             return SendResult(
                 success=False,
@@ -1105,6 +1160,155 @@ class NatsAdapter(BasePlatformAdapter):
             )
         try:
             await self._send_text(stream, content)
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"stream.send failed: {exc}",
+                retryable=False,
+            )
+        return SendResult(success=True, message_id=uuid.uuid4().hex)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Publish an image as a :class:`ResponseChunk` with one attachment.
+
+        Wraps the file in :meth:`Attachment.from_path` (base64 at the
+        constructor, per the SDK's envelope.py) and sends one chunk
+        carrying ``caption`` as ``text`` + the image in ``attachments``.
+        The caller's NATS client sees it as the §6.3 keyed-object form
+        ``{type: response, data: {text, attachments: [...]}}``.
+        """
+        return await self._send_attachment(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            kind="image",
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Publish a generic file as a :class:`ResponseChunk` attachment.
+
+        ``file_name`` overrides the filename that lands on the wire — useful
+        for tool paths that stage downloads under a hash and want to
+        present the original name to the caller.
+        """
+        return await self._send_attachment(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            kind="document",
+            override_filename=file_name,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Publish audio as an attachment. v0.1 has no voice/audio distinction
+        on the wire — the caller interprets by filename extension (§5.2).
+        """
+        return await self._send_attachment(
+            chat_id=chat_id,
+            file_path=audio_path,
+            caption=caption,
+            kind="voice",
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Publish video as an attachment (same wire shape as images — §5.2)."""
+        return await self._send_attachment(
+            chat_id=chat_id,
+            file_path=video_path,
+            caption=caption,
+            kind="video",
+        )
+
+    async def _send_attachment(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str],
+        kind: str,
+        override_filename: Optional[str] = None,
+    ) -> SendResult:
+        """Build a one-attachment :class:`ResponseChunk` and publish it.
+
+        Centralized so the four ``send_*`` helpers share filename
+        resolution, file-existence checks, the attachment construction,
+        and the shared race-safe stream lookup. The ``kind`` parameter
+        is used only for error messages — the v0.1 wire carries the
+        attachment identically regardless of media type.
+        """
+        stream = self._resolve_stream(chat_id)
+        if stream is None:
+            return SendResult(
+                success=False,
+                error=f"no active NATS stream for chat_id={chat_id}",
+            )
+
+        path = Path(file_path)
+        if not path.exists():
+            return SendResult(
+                success=False,
+                error=f"{kind} path not found: {file_path}",
+            )
+
+        attachment_factory = getattr(natsagent, "Attachment", None)
+        chunk_factory = getattr(natsagent, "ResponseChunk", None)
+        if attachment_factory is None or chunk_factory is None:
+            return SendResult(
+                success=False,
+                error="natsagent SDK missing Attachment / ResponseChunk",
+            )
+
+        try:
+            if override_filename is not None:
+                # from_path would pin ``path.name``; honor the caller's
+                # explicit override by reading bytes then building via
+                # from_bytes.
+                attachment = attachment_factory.from_bytes(
+                    override_filename, path.read_bytes()
+                )
+            else:
+                attachment = attachment_factory.from_path(str(path))
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=f"{kind} attachment build failed: {exc}",
+            )
+
+        try:
+            chunk = chunk_factory(text=caption or "", attachments=[attachment])
+            await stream.send(chunk)
         except Exception as exc:
             return SendResult(
                 success=False,

@@ -434,7 +434,7 @@ class TestSend:
     async def test_publishes_response_chunk_when_stream_is_registered(self):
         adapter = _build_adapter()
         stream = _fake_stream()
-        adapter._active_streams["alice"] = stream
+        adapter._active_streams[("alice", id(stream))] = stream
 
         result = await adapter.send(chat_id="alice", content="hi")
 
@@ -455,7 +455,7 @@ class TestSend:
         adapter = _build_adapter()
         stream = _fake_stream()
         stream.send = AsyncMock(side_effect=RuntimeError("broken pipe"))
-        adapter._active_streams["alice"] = stream
+        adapter._active_streams[("alice", id(stream))] = stream
 
         result = await adapter.send(chat_id="alice", content="hi")
         assert result.success is False
@@ -651,7 +651,10 @@ class TestOnPromptIntegration:
 
         await adapter._on_prompt(envelope, stream)
 
-        assert observed["active_streams_during_run"] == {"bob": stream}
+        # T5.0 — the registry is compound-keyed (chat_id, id(stream)) so
+        # overlapping x-session prompts can coexist. The contextvar is the
+        # race-safe primary lookup; this dict is the diagnostic fallback.
+        assert observed["active_streams_during_run"] == {("bob", id(stream)): stream}
         # After the handler returns, the stream must be gone so a later
         # send() to the same chat_id fails fast.
         assert adapter._active_streams == {}

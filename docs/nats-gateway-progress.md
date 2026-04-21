@@ -20,8 +20,8 @@ Do not rewrite the design doc unless the user asks. If a design decision turns o
 
 ## Status
 
-- **Last completed phase:** Phase 4 — Inbound path (T4.1 through T4.4)
-- **Next phase:** Phase 5 — Outbound attachments & formatting (T5.0 through T5.5). **T5.0 is a Phase-4-shortcoming #1 fix folded in as a prerequisite** — see the "Fold-in justification" note at the top of Phase 5 below.
+- **Last completed phase:** Phase 5 — Outbound attachments & formatting (T5.0 through T5.5)
+- **Next phase:** Phase 6 — Mid-stream queries (NATS-local), T6.1 through T6.4
 - **Branch:** `nats-gateway` (feature branch; PR target is `main`)
 - **Known blockers:** none
 - **Open design questions pending user input:** 4 items listed in §16 of `docs/nats-gateway-design.md`. Default answers are noted there; proceed with defaults unless the user redirects.
@@ -71,16 +71,12 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 
 **Fold-in justification (T5.0).** Phase 4's "known shortcoming #1" — concurrent prompts on the same `x-session` overwrite `_active_streams[chat_id]` so tool outputs from handler A can land on handler B's reply subject — was deliberately deferred at Phase 4's close. Phase 5 adds four new tool-accessible methods (`send_image_file` / `send_document` / `send_voice` / `send_video`) that all resolve through `_active_streams[chat_id]`, so the blast radius of the race quadruples in this phase. Fixing it here (before the send helpers) costs less than retrofitting later — build the send helpers on a race-safe lookup rather than patching four call sites after the fact.
 
-- [ ] **T5.0** — Race-safe stream lookup. Options (pick one during implementation):
-  * **(a) Pass-through:** plumb the handler's own `PromptStream` into tool calls via a contextvar / `asyncio.TaskGroup`-scoped state, so each tool fires on *its* handler's stream regardless of `_active_streams` state. Cleanest but touches the tool dispatch surface.
-  * **(b) Compound key:** key `_active_streams` by `(chat_id, stream_id)` (e.g. id of the PromptStream object) and have send helpers look up through the caller's captured handler context rather than chat_id alone.
-  * **(c) Per-chat_id stack:** `_active_streams[chat_id]` becomes a `list[PromptStream]`; `_on_prompt` pushes on entry, pops on exit, send helpers use the top-of-stack. Simplest change but LIFO semantics are wrong for legitimate concurrent sessions — second handler's sends would go to the first stream until the first exits. Reject unless (a)/(b) prove too invasive.
-  * **Recommendation:** start with (b). The other two are heavier lifts; (b) is a 2-line dict shape change + one call-site update per send helper.
-- [ ] **T5.1** — Implement `send_image_file` (`Attachment.from_path(path)` → `stream.send(ResponseChunk(text=caption, attachments=[...]))`), built on the T5.0 race-safe lookup.
-- [ ] **T5.2** — Implement `send_document` (same pattern, generic file)
-- [ ] **T5.3** — Implement `send_voice` / `send_video` (same pattern; v0.1 doesn't distinguish on wire)
-- [ ] **T5.4** — `format_message()` override (no-op for symmetry — NATS carries text verbatim; already landed in Phase 4 as a class method, but confirm it's wired into the same call paths Phase 5 uses)
-- [ ] **T5.5** — `tests/gateway/test_nats_outbound.py` — image/doc/voice → ResponseChunk.attachments[0] shape, **plus a concurrent-x-session regression test**: two overlapping `_on_prompt` invocations with the same chat_id, each firing a send helper, must land on their own streams respectively (this is the T5.0 regression guard and belongs in the outbound test file because the send helpers are where the race becomes observable).
+- [x] **T5.0** — Race-safe stream lookup. **Landed as a contextvar-primary hybrid of (a)+(b):** `_active_streams` became a `dict[tuple[str, int], PromptStream]` (compound key on `(chat_id, id(stream))` so concurrent same-`x-session` handlers don't overwrite each other in the registry), plus a module-level `_current_stream: ContextVar[PromptStream | None]` that `_on_prompt` sets at entry and resets in `finally`. Send helpers first consult the contextvar (inherited through `asyncio.Task` / `run_in_executor` context propagation), then fall back to the dict by `chat_id` only for sends scheduled outside the handler's context. See Decision log 2026-04-21 entry for the "why contextvar-first" rationale.
+- [x] **T5.1** — Implement `send_image_file` (`Attachment.from_path(path)` → `stream.send(ResponseChunk(text=caption, attachments=[...]))`), built on the T5.0 race-safe lookup.
+- [x] **T5.2** — Implement `send_document` (same pattern, generic file; `file_name` override uses `from_bytes` to honor the caller's explicit wire filename)
+- [x] **T5.3** — Implement `send_voice` / `send_video` (same pattern; v0.1 doesn't distinguish on wire)
+- [x] **T5.4** — `format_message()` override (no-op for symmetry — NATS carries text verbatim; already landed in Phase 4 as a class method, outbound test module now asserts the verbatim contract)
+- [x] **T5.5** — `tests/gateway/test_nats_outbound.py` — image/doc/voice → ResponseChunk.attachments[0] shape, plus a concurrent-`x-session` regression test (`TestConcurrentSameSessionRegression`) gating two overlapping handlers on `asyncio.Event`s so both are mid-flight when each calls `send_image_file`; proves contextvar-scoped lookup routes each send to its own stream.
 
 ### Phase 6 — Mid-stream queries (NATS-local)
 
@@ -248,11 +244,33 @@ Surfaced during Phase 4 self-review. `gateway/run.py:_is_user_authorized` had no
 
 Surfaced during Phase 4 self-review. `_looks_like_command` tolerates leading whitespace (``"  /help"`` → True, covered by tests), but `MessageEvent.is_command` / `get_command()` in `base.py:732` require literal `text.startswith("/")`. Before the fix, a whitespace-prefixed command would pass our heuristic → we'd mark it as `MessageType.COMMAND` and call `_dispatch_command(event, stream)` → the gateway's `_handle_message` → `event.get_command()` returns `None` → falls through to the text-agent path, which we already decided to bypass. Net result: silent misrouting. Fix: when `is_command` is True, set `event_text = prompt_text.lstrip()` before constructing the `MessageEvent`. Regression test in `test_nats_inbound.py::TestOnPromptIntegration::test_command_text_is_lstripped_for_gateway_dispatch`.
 
+### 2026-04-21 — Phase 5 — T5.0 landed as contextvar-first, dict as diagnostic fallback
+
+Plan called for option (b) "compound-key dict". In implementation, a pure compound-key dict still forces send helpers to *know* `id(stream)` at call time, which means every caller would need the stream threaded through — the exact "touches tool dispatch surface" cost that option (a) was flagged for. Merged the approaches: the dict is compound-keyed (so the `_on_prompt` finally block can pop-exactly-the-right-entry instead of guessing, and concurrent handlers literally coexist in the registry), AND a module-level `_current_stream: ContextVar[PromptStream | None]` is set at handler entry / reset in finally. `_resolve_stream(chat_id)` consults the contextvar first (race-safe, inherited via `run_in_executor`'s default `copy_context()`) and only falls back to the dict for sends scheduled outside handler context. Cost: +1 contextvar, +1 resolver method, no tool-dispatch surface changes. Test callers in `test_nats_inbound.py::TestSend` had to update from `adapter._active_streams["alice"] = stream` → `adapter._active_streams[("alice", id(stream))] = stream` (4 sites).
+
+### 2026-04-21 — Phase 5 — `send_document(file_name=...)` switches from `from_path` to `from_bytes`
+
+Design table in §8.2 specifies `Attachment.from_path(image_path)` uniformly for all four send helpers. In practice, `from_path` pins `filename=Path(path).name` — which is wrong when the caller staged the file under a content-hash name but wants the recipient to see the original filename. Telegram's `send_document` accepts an explicit `file_name` parameter for exactly this reason (`telegram.py:1811`). The NATS impl honors it by reading the bytes and re-building via `Attachment.from_bytes(override_filename, data)`. The other three helpers (no override semantics) still use `from_path` directly.
+
+### 2026-04-21 — Phase 5 — Concurrent-regression test uses `asyncio.Event` gating, not timing
+
+The concurrency regression test in `TestConcurrentSameSessionRegression` does NOT rely on `asyncio.sleep` to create overlap — that's racy under load. Instead, handler A blocks on `b_sent_image.wait()`, handler B blocks on `start_a.wait()`, and both handlers explicitly signal progress via events. This guarantees the assertion "A's `send_image_file` ran while both streams were registered in `_active_streams`" holds regardless of scheduler jitter.
+
+### 2026-04-21 — Phase 5 — Missing file paths return `SendResult(success=False)`, don't raise
+
+`send_image_file("/does/not/exist.png")` returns a failure result rather than raising. Rationale: these helpers are invoked from tool code and from `gateway/run.py`'s `_deliver_media_from_response` in best-effort chains (`logger.warning` on failure, continue with next file). Raising would break that pattern and force every call site to wrap a try/except. The Telegram adapter takes the same stance (`telegram.py:1785`). Tests also assert that `stream.send` is NOT awaited on failure — no partial chunks leak onto the reply subject.
+
+### 2026-04-21 — Phase 5 — Known shortcomings (NOT fixed in Phase 5; carry forward)
+
+1. **Contextvar does NOT propagate through `asyncio.run_coroutine_threadsafe`.** If a worker-thread tool schedules an adapter send via `run_coroutine_threadsafe(adapter.send_image_file(...), loop)`, the new Task on the main loop starts with a fresh context — `_current_stream` is unset and the fallback dict lookup runs. When two concurrent handlers share a `chat_id`, the fallback returns whichever stream happens to be registered first. Current hermes tool code doesn't schedule sends this way (it either directly-awaits from an async tool or constructs a fresh adapter), so this is a latent issue, not an active one. If tools grow a cross-thread scheduling path, the fix is to capture `_current_stream.get()` in the executor thread and pass it explicitly to the scheduled coroutine.
+
+2. **Ordering caveat in the dict fallback.** `_resolve_stream` iterates `_active_streams` and returns the first matching `chat_id` — deterministic (`dict` preserves insertion order in Python 3.7+) but arbitrary. For legitimate concurrent sessions this only matters when the contextvar path is unavailable (see shortcoming #1). Acceptable for MVP.
+
 ### 2026-04-21 — Phase 4 — Known shortcomings (NOT fixed in Phase 4; carry forward)
 
 Each of these is a deliberate MVP trade-off that should either land in a later phase or be promoted to a design-doc non-goal. Logged here so future Claudes don't waste cycles rediscovering them as "bugs".
 
-1. **Concurrent prompts on the same `x-session` overwrite `_active_streams[chat_id]`.** Two prompts with the same `x-session` arriving in quick succession race — the second replaces the first in `_active_streams`, so tool outputs from the first handler (e.g., `send_image_file`) land on the second handler's reply subject. The finally-block guards against popping the wrong key on cleanup (`current is stream`) but that only protects exit; it doesn't protect the mid-handler mis-route. **Status: SCHEDULED for Phase 5 as T5.0** (folded in as a prerequisite because the four new `send_*` tool methods quadruple the blast radius). See Phase 5's "Fold-in justification" note above for implementation options (a/b/c).
+1. **Concurrent prompts on the same `x-session` overwrite `_active_streams[chat_id]`.** ~~Two prompts with the same `x-session` arriving in quick succession race — the second replaces the first in `_active_streams`, so tool outputs from the first handler (e.g., `send_image_file`) land on the second handler's reply subject.~~ **RESOLVED in Phase 5 via T5.0.** `_active_streams` is now compound-keyed on `(chat_id, id(stream))` and send helpers prefer the `_current_stream` contextvar. Regression test: `tests/gateway/test_nats_outbound.py::TestConcurrentSameSessionRegression`. A narrow residual window — sends scheduled across `asyncio.run_coroutine_threadsafe` boundaries — is documented under Phase 5 shortcoming #1 above.
 
 2. **`/stop` cannot interrupt a running NATS agent.** We bypass `self.handle_message(event)` for text prompts (design doc §6.1, api_server-style agent ownership), so `_active_sessions[session_key]` in `BasePlatformAdapter` is never populated. The gateway's `/stop` handler walks `_active_sessions` to find a running agent — for NATS that dict is always empty, so `/stop` becomes a no-op. Callers can drop their NATS subscription to abandon a run; real interrupt support would require either (a) routing text through `handle_message` and adding a NATS-aware stream consumer, or (b) adapter-local active-session tracking that the `/stop` handler is taught to consult. Defer to post-MVP.
 
