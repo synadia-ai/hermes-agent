@@ -233,6 +233,30 @@ Phase 3's `ResponseChunk = MagicMock` was good enough for the placeholder handle
 
 The SDK's `_on_prompt_request` has two clauses: `except Exception` → respond 500 + terminator, but `CancelledError` (a `BaseException` in 3.11+) falls through. Phase 4's handler mirrors that split — `CancelledError` re-raises so shutdown cancellation propagates cleanly through `_teardown_handles`'s `gather(return_exceptions=True)`. Arbitrary exceptions also re-raise so the SDK can convert them into a 500 error frame; we log them at ERROR level first so the gateway log has the full stack trace, not just the SDK's sanitized description line.
 
+### 2026-04-21 — Phase 4 post-review — Authorization: NATS added to `_is_user_authorized` early-return set
+
+Surfaced during Phase 4 self-review. `gateway/run.py:_is_user_authorized` had no handling for `Platform.NATS`. Commands dispatched via `_message_handler` hit the user allowlist check, which treated the caller's `x-session` string as a user_id and rejected it unless pre-paired — so `/help` over NATS replied with a pairing code instead of the help text. Design doc §10.1 already delegates NATS authorization to the NATS server layer (accounts / NKey / JWT / TLS), mirroring Webhook (HMAC) and HomeAssistant (HASS_TOKEN). Fix: add `Platform.NATS` to the `(HOMEASSISTANT, WEBHOOK)` early-return tuple. Regression test lives in `tests/gateway/test_unauthorized_dm_behavior.py::test_nats_is_authorized_without_user_allowlist`.
+
+### 2026-04-21 — Phase 4 post-review — Command text lstripped before `MessageEvent` construction
+
+Surfaced during Phase 4 self-review. `_looks_like_command` tolerates leading whitespace (``"  /help"`` → True, covered by tests), but `MessageEvent.is_command` / `get_command()` in `base.py:732` require literal `text.startswith("/")`. Before the fix, a whitespace-prefixed command would pass our heuristic → we'd mark it as `MessageType.COMMAND` and call `_dispatch_command(event, stream)` → the gateway's `_handle_message` → `event.get_command()` returns `None` → falls through to the text-agent path, which we already decided to bypass. Net result: silent misrouting. Fix: when `is_command` is True, set `event_text = prompt_text.lstrip()` before constructing the `MessageEvent`. Regression test in `test_nats_inbound.py::TestOnPromptIntegration::test_command_text_is_lstripped_for_gateway_dispatch`.
+
+### 2026-04-21 — Phase 4 — Known shortcomings (NOT fixed in Phase 4; carry forward)
+
+Each of these is a deliberate MVP trade-off that should either land in a later phase or be promoted to a design-doc non-goal. Logged here so future Claudes don't waste cycles rediscovering them as "bugs".
+
+1. **Concurrent prompts on the same `x-session` overwrite `_active_streams[chat_id]`.** Two prompts with the same `x-session` arriving in quick succession race — the second replaces the first in `_active_streams`, so tool outputs from the first handler (e.g., `send_image_file`) land on the second handler's reply subject. The finally-block guards against popping the wrong key on cleanup (`current is stream`) but that only protects exit; it doesn't protect the mid-handler mis-route. Acceptable for MVP because the typical caller pattern is one concurrent request per session; a production-grade fix would key `_active_streams` by `(chat_id, stream_instance)` or maintain a per-chat_id stack. Should get a test + fix in Phase 5 or 6.
+
+2. **`/stop` cannot interrupt a running NATS agent.** We bypass `self.handle_message(event)` for text prompts (design doc §6.1, api_server-style agent ownership), so `_active_sessions[session_key]` in `BasePlatformAdapter` is never populated. The gateway's `/stop` handler walks `_active_sessions` to find a running agent — for NATS that dict is always empty, so `/stop` becomes a no-op. Callers can drop their NATS subscription to abandon a run; real interrupt support would require either (a) routing text through `handle_message` and adding a NATS-aware stream consumer, or (b) adapter-local active-session tracking that the `/stop` handler is taught to consult. Defer to post-MVP.
+
+3. **Unbounded `delta_queue`.** `asyncio.Queue()` is unbounded by default; if the model produces deltas faster than `stream.send` can drain them, memory grows linearly with the run. Not practical at LLM token rates (thousands of tokens per second max, each chunk small) but would matter if we ever drove a non-token data stream through the same pump. Not scheduled for a fix.
+
+4. **Attachment-validation errors return SDK 500, not 400.** The SDK's `_on_prompt_request` only maps `ProtocolError` to 400; anything else becomes 500. `cache_image_from_bytes` raising `ValueError` on non-image bytes is caller-fault and should be 400 per §9.3 semantics, but the handler raises `RuntimeError` → 500. Fix requires either importing `natsagent.ProtocolError` directly (tight coupling to a module the test-harness mock barely models) or plumbing a typed error-response path. Noted in the Phase 4 attachment decision-log entry; revisit if callers complain.
+
+5. **Session interrupt / busy-session merging is gone.** `BasePlatformAdapter.handle_message` has useful logic for "photo burst merging", "busy-session handoff", and "pending-message queue drain". NATS `_on_prompt` bypasses all of that. For a request/reply wire protocol that's fine (the caller controls concurrency), but anything downstream that assumes `_pending_messages`/`_active_sessions` population won't work over NATS. Document as a limitation.
+
+6. **Private `stream._request.data` access for x-session peek.** Design doc §3 option (b), pre-approved. If the SDK renames `_request` or `data`, we blow up loud at handler entry (AttributeError via `getattr(..., None)` returning None → falls back to session default). Acceptable for MVP; upstream a public raw-bytes handle to `nats-ai-pysdk` when convenient.
+
 ---
 
 ## Task definitions reference

@@ -599,6 +599,40 @@ class TestOnPromptIntegration:
         assert event.message_type is MessageType.COMMAND
 
     @pytest.mark.asyncio
+    async def test_command_text_is_lstripped_for_gateway_dispatch(self, monkeypatch):
+        # Regression guard: ``_looks_like_command`` tolerates leading
+        # whitespace, but ``MessageEvent.is_command`` / ``get_command()``
+        # in base.py:732 require literal ``text.startswith("/")``. If we
+        # pass the raw prompt with leading whitespace, the gateway's
+        # command registry misses the dispatch and the caller sees the
+        # text prompt path instead of the command response.
+        adapter = _build_adapter()
+        envelope = MagicMock()
+        envelope.prompt = "  /help"
+        envelope.attachments = None
+        stream = _fake_stream(b'{"prompt":"  /help"}')
+
+        dispatched: list = []
+
+        async def _fake_dispatch(event, s):
+            dispatched.append(event)
+
+        async def _fake_text(*args, **kwargs):
+            raise AssertionError("text path must not run for whitespace-prefixed command")
+
+        monkeypatch.setattr(adapter, "_dispatch_command", _fake_dispatch)
+        monkeypatch.setattr(adapter, "_run_text_prompt", _fake_text)
+
+        await adapter._on_prompt(envelope, stream)
+
+        assert len(dispatched) == 1
+        event = dispatched[0]
+        # event.text must start with "/" — otherwise MessageEvent.get_command
+        # returns None and the gateway's command registry misses the dispatch.
+        assert event.text.startswith("/")
+        assert event.get_command() == "help"
+
+    @pytest.mark.asyncio
     async def test_registers_stream_and_cleans_up_on_success(self, monkeypatch):
         adapter = _build_adapter()
         envelope = MagicMock()

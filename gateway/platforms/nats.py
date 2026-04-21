@@ -636,8 +636,16 @@ class NatsAdapter(BasePlatformAdapter):
                 user_name=chat_id,
             )
             is_command = self._looks_like_command(prompt_text)
+            # ``_looks_like_command`` lstrips before matching so ``"  /help"``
+            # is still classified as a command. ``MessageEvent.is_command``
+            # / ``get_command()`` in base.py, by contrast, require the
+            # literal ``/`` at index 0 — leading whitespace would cause the
+            # gateway's command registry to miss the dispatch and fall
+            # through to the agent path. Canonicalize the text here when
+            # we've decided it's a command so the two heuristics agree.
+            event_text = prompt_text.lstrip() if is_command else prompt_text
             event = MessageEvent(
-                text=prompt_text,
+                text=event_text,
                 message_type=MessageType.COMMAND if is_command else message_type,
                 source=source,
                 media_urls=media_urls,

@@ -100,6 +100,32 @@ def test_whatsapp_lid_user_matches_phone_allowlist_via_session_mapping(monkeypat
     assert runner._is_user_authorized(source) is True
 
 
+def test_nats_is_authorized_without_user_allowlist(monkeypatch):
+    """NATS authenticates at the server/account layer (NKey / JWT / TLS)
+    — design doc §10.1. The gateway's user allowlist doesn't apply to the
+    ``x-session`` value we use as user_id, so ``_is_user_authorized`` must
+    return True unconditionally for Platform.NATS, the same way it does
+    for HomeAssistant (HASS_TOKEN) and Webhook (HMAC). Without this, every
+    ``/help`` over NATS replies with a pairing code instead of the help
+    text because the caller's x-session string isn't in any allowlist.
+    """
+    _clear_auth_env(monkeypatch)
+
+    runner, _adapter = _make_runner(
+        Platform.NATS,
+        GatewayConfig(platforms={Platform.NATS: PlatformConfig(enabled=True)}),
+    )
+
+    source = SessionSource(
+        platform=Platform.NATS,
+        user_id="alice-session",
+        chat_id="alice-session",
+        user_name="alice-session",
+        chat_type="dm",
+    )
+    assert runner._is_user_authorized(source) is True
+
+
 def test_star_wildcard_in_allowlist_authorizes_any_user(monkeypatch):
     """WHATSAPP_ALLOWED_USERS=* should act as allow-all wildcard."""
     _clear_auth_env(monkeypatch)
