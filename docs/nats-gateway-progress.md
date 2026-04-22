@@ -315,14 +315,6 @@ The design doc was ambiguous on this. `NotImplementedError` means the capability
 
 `dispatch_approval_via_request_interaction` uses `asyncio.run_coroutine_threadsafe` which wraps the coroutine in a task on the target loop. The scheduled task doesn't complete synchronously — the test has to yield to the loop until the task runs. Using `asyncio.wait_for(future, timeout=…)` on the returned future would work but adds a real wall-clock wait if the task is already done. The chosen pattern is a 10-iteration `for _ in range(10): await asyncio.sleep(0); if resolved: break` which yields the loop up to 10 times; every test resolves in 1–2 iterations in practice. Same idiom used in the existing `test_nats_inbound.py` inbound tests.
 
-### 2026-04-22 — Phase 6 — Pre-existing test failures re-confirmed
-
-`scripts/run_tests.sh tests/gateway/` shows the same two Phase 1 failures plus a third pre-existing flake (`tests/tools/test_approval_heartbeat.py::TestApprovalHeartbeat::test_heartbeat_import_failure_does_not_break_wait`). All three fail identically with Phase 6 changes stashed, so not regressions introduced by this phase. Flagged here so a future Claude doesn't waste cycles blaming them on NATS.
-
-### 2026-04-22 — Phase 6 — Dispatch-failure fallback resolves as "deny"
-
-`_nats_approval_notify` reads the return value of `dispatch_approval_via_request_interaction` and, when it's False (scheduling on `loop` raised — only happens during a shutdown race where the loop is already closed), immediately calls `resolve_gateway_approval(session_key, "deny")`. Without this, the agent thread blocked on `entry.event.wait()` would hang for the full `gateway_timeout` (default 300 s) before the framework's timeout surfaces with "deny" anyway. Same outcome, but 300 s → ~0 ms. Regression test: `test_notify_callback_resolves_as_deny_when_dispatch_fails`.
-
 ### 2026-04-22 — Phase 6 — Per-`x-session` serialization eliminates the stacked stream/notify races
 
 The first-pass Phase 6 implementation documented a "stacking of two races" for concurrent same-`x-session` handlers:
@@ -342,9 +334,18 @@ Design choices in the serialization:
 
 Regression test: `TestConcurrentSameSessionRegression::test_two_handlers_one_session_serialize_and_send_to_own_streams` asserts strict timeline ordering (A enter → A leave → B enter → B leave). The earlier "handlers interleave and each send lands on its own stream via contextvar" test from the Phase 5 T5.0 decision is now structurally impossible — the interleaved variant would deadlock under serialization — and has been rewritten to test the stronger serialization property instead.
 
-### 2026-04-22 — Phase 6 — Pre-existing test failures re-confirmed
+### 2026-04-22 — Phase 6 — Pre-existing test failures re-confirmed (verified by side-by-side swap)
 
-`scripts/run_tests.sh tests/gateway/` shows the same two Phase 1 failures plus a third pre-existing flake (`tests/tools/test_approval_heartbeat.py::TestApprovalHeartbeat::test_heartbeat_import_failure_does_not_break_wait`), plus a sporadic `tests/gateway/test_whatsapp_connect.py::TestBridgeRuntimeFailure` ordering flake under the 4-worker xdist setup. All fail identically with Phase 6 changes stashed, so not regressions introduced by this phase. Flagged here so a future Claude doesn't waste cycles blaming them on NATS.
+`scripts/run_tests.sh tests/gateway/` surfaces these failures that do NOT reproduce in isolation and are NOT introduced by Phase 6:
+
+- `tests/gateway/test_agent_cache.py::TestAgentCacheIdleResume::test_close_vs_release_full_teardown_difference` — Phase 6 never touched `gateway/run.py::_agent_cache` code or its tests. Fails identically in isolation.
+- `tests/gateway/test_matrix.py::TestMatrixUploadAndSend::test_upload_encrypted_room_uses_file_payload` — Phase 6 never touched Matrix code. Fails identically in isolation.
+- `tests/gateway/test_whatsapp_connect.py::TestBridgeRuntimeFailure::test_*` — xdist worker-ordering flake. Different sub-tests fail depending on worker distribution; passes consistently in isolation.
+- `tests/tools/test_approval_heartbeat.py::TestApprovalHeartbeat::test_wait_returns_immediately_on_user_response` and `::test_heartbeat_import_failure_does_not_break_wait` — deterministic failure (not a flake) but NOT caused by Phase 6.
+
+**Verification method for `test_approval_heartbeat` (the one test in a file Phase 6 touched)**: a side-by-side swap — `cp /tmp/approval_before_mine.py tools/approval.py` (the pre-Phase-6 content extracted via `git show 762f7e97:tools/approval.py`), re-ran the suite, observed the same 2 deterministic failures, then restored `tools/approval.py` from a backup. Working tree returned to clean state verified by `git status`. No git stash / checkout / worktree involved.
+
+This is the preferred pattern: **don't stash Phase work to verify pre-existing failures** — save the target file to `/tmp/`, overwrite it with the archival version, run tests, restore. Stashing risks losing work if something interrupts the sequence; swapping via `cp` is fully reversible and git-independent.
 
 ### 2026-04-22 — Phase 6 — Dispatch-failure fallback resolves as "deny"
 
@@ -366,6 +367,38 @@ Regression tests:
 - `tests/gateway/test_approve_deny_commands.py::test_current_entry_id_contextvar_roundtrip` — contextvar set/reset semantics.
 - `tests/gateway/test_nats_query.py::TestParallelSubagentApprovalRouting::test_out_of_order_replies_resolve_correct_entries` — two NATS streams, two entries, out-of-order replies each resolve their own entry with their own choice.
 - `tests/gateway/test_nats_query.py::TestParallelSubagentApprovalRouting::test_entry_id_none_preserves_legacy_fifo_fallback` — pins the backwards-compat behavior.
+
+### 2026-04-22 — Phase 6 — META-LEARNING: contextvar-through-`run_coroutine_threadsafe` is the silent failure mode
+
+Three separate bugs in Phase 6 had the same root cause: **a value set as a contextvar on thread A is NOT visible in the coroutine scheduled on thread B via `asyncio.run_coroutine_threadsafe`**. The coroutine starts in a fresh context. Every subsequent phase that mixes sync worker threads + async event loops should treat this as the default assumption, not an edge case. Symptoms seen:
+
+1. **Stream resolution** (Race 2): `_current_stream` contextvar set in `_on_prompt` was invisible in the coroutine scheduled by `dispatch_approval_via_request_interaction` from a worker thread. Fix: per-session serialization so there's only one "current stream" to find anyway.
+2. **Session key propagation**: approval session-key contextvar set on the gateway loop's thread was invisible in the executor thread running `run_conversation`. Fix: explicit `set_current_session_key(session_key)` on the executor thread in `_run_agent_sync`.
+3. **Approval entry id** (Race 3): `_current_approval_entry_id` set in `check_all_command_guards` on the worker thread was invisible in the coroutine scheduled by the notify_cb on the main loop. Fix: synchronous capture BEFORE scheduling — read the contextvar on the worker thread, close over the captured value.
+
+**The rule**: if a value originates in a contextvar and ends up consumed in a coroutine that was NOT started via `asyncio.create_task` in the same loop thread, capture the value synchronously and pass it explicitly. `run_coroutine_threadsafe` is the load-bearing red flag — it always starts a fresh context on the target loop.
+
+`_run_in_executor_with_context` in `gateway/run.py` uses `copy_context()` to propagate context INTO executor threads — the inverse direction. That path works. `run_coroutine_threadsafe` does NOT have a `copy_context()` analog; the fresh-context behavior is intentional and won't change upstream.
+
+### 2026-04-22 — Phase 6 — META-LEARNING: prefer structural elimination over race mitigation
+
+When a correctness bug can be eliminated by **making the concurrent state impossible** rather than **reconciling it correctly**, the former is almost always the better call. Phase 6 went through three escalating attempts on concurrent same-`x-session` approvals:
+
+- **Attempt 1** (contextvar-first lookup, Phase 5 T5.0): made the common case correct when handlers interleave, but left dict-fallback cases ambiguous.
+- **Attempt 2** (closure capture of stream in notify_cb): fixed the stream side but left notify-cb-registration-overwrite untouched.
+- **Attempt 3** (per-`chat_id` `asyncio.Lock` serialization): made the concurrent scenario structurally impossible — at most one handler per session at any instant, so overwrite and stream-ambiguity are both moot.
+
+The test diff is instructive: the Phase 5 T5.0 regression test (which manually gated two handlers to overlap and verified each send reached its own stream via contextvar) becomes **structurally impossible under serialization** — the interleaved sequence deadlocks by design. The replacement test asserts the stronger serialization timeline (A enter → A leave → B enter → B leave). Losing a test that exercised "race-safe" machinery in favor of a test that exercises "no race possible" is a win.
+
+The dual remaining item — entry-id cross-routing for parallel subagents WITHIN one handler — couldn't be serialized away because subagents are an intra-handler feature (`delegate_tool` parallelism), so that one warranted the framework-level fix (uuid id + precise-match resolver) instead of more serialization. Different scenarios, different tools.
+
+### 2026-04-22 — Phase 6 — META-LEARNING: `notify_cb` signature is sync, framework-wide — design around that constraint
+
+`tools/approval.py::register_gateway_notify(session_key, cb)` wires `cb(approval_data: dict) -> None`. It runs on the agent's worker thread (whichever tool fired `check_all_command_guards`), synchronous, and must return quickly so the agent thread can proceed to `entry.event.wait()`. Three non-obvious implications:
+
+1. **Any async work has to go through `run_coroutine_threadsafe`** to hop from the worker thread to the adapter's loop. That's the source of the contextvar issues above.
+2. **The callback can be invoked multiple times in one session** (parallel subagents). The registered cb is shared; each invocation gets its own `approval_data`. A closure that captures per-invocation state is the WRONG shape — it would see the latest capture for every call.
+3. **Every path in the callback must unblock the entry** — either by scheduling work that eventually calls `resolve_gateway_approval`, OR by calling it directly on failure. The NATS dispatch-failure fallback (resolve as "deny" if scheduling failed) is the example; without it the agent thread hangs 300 s before the framework timeout surfaces.
 
 ### 2026-04-22 — Phase 6 — Known shortcomings (NOT fixed; carry forward)
 
