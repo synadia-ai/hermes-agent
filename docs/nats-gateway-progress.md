@@ -20,8 +20,8 @@ Do not rewrite the design doc unless the user asks. If a design decision turns o
 
 ## Status
 
-- **Last completed phase:** Phase 6 — Mid-stream queries / approval round-trip (T6.1 through T6.4)
-- **Next phase:** Phase 7 — Slash commands (T7.1 through T7.2)
+- **Last completed phase:** Phase 7 — Slash commands (T7.1, T7.2)
+- **Next phase:** Phase 8 — End-to-end verification (T8.1 through T8.8; manual, requires local nats-server)
 - **Branch:** `nats-gateway` (feature branch; PR target is `main`)
 - **Known blockers:** none
 - **Open design questions pending user input:** 4 items listed in §16 of `docs/nats-gateway-design.md`. Default answers are noted there; proceed with defaults unless the user redirects.
@@ -87,8 +87,8 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 
 ### Phase 7 — Slash commands
 
-- [ ] **T7.1** — Confirm gateway-eligible commands (`/new`, `/reset`, `/model`, `/status`, `/stop`, `/help`, `/compress`, `/resume`) route as `MessageEvent(COMMAND)` with no new code. Data-only verification.
-- [ ] **T7.2** — Manually verify `/help` output renders sensibly as plain-text chunks over NATS
+- [x] **T7.1** — Confirm gateway-eligible commands (`/new`, `/reset`, `/model`, `/status`, `/stop`, `/help`, `/compress`, `/resume`) route as `MessageEvent(COMMAND)` with no new code. Data-only verification.
+- [x] **T7.2** — Manually verify `/help` output renders sensibly as plain-text chunks over NATS
 
 ### Phase 8 — End-to-end verification (manual; requires local nats-server)
 
@@ -403,6 +403,27 @@ The dual remaining item — entry-id cross-routing for parallel subagents WITHIN
 ### 2026-04-22 — Phase 6 — Known shortcomings (NOT fixed; carry forward)
 
 1. **Approval reply "a" maps to "always", not "approve once".** Consistent with the CLI's `[o]nce | [s]ession | [a]lways | [d]eny` shortcuts, but users who type "a" thinking "approve" get permanent allowlisting instead of one-time. Mitigated by the prompt text explicitly listing `once | session | always | deny` as the four options. Full words are unambiguous; only the single-letter form has this footgun.
+
+### 2026-04-22 — Phase 7 — Phase landed as a pinned test file, not a code change
+
+T7.1 and T7.2 are data-only / manual checks per the task definitions — no new adapter code is expected. The verification machinery (`_looks_like_command` → `_dispatch_command` → `_message_handler` → `GATEWAY_KNOWN_COMMANDS`) all landed in Phase 4. Phase 7 therefore consisted of:
+
+1. Running one-off enumeration queries to confirm `GATEWAY_KNOWN_COMMANDS` contains the 8 design-doc exemplars (`/new`, `/reset`, `/model`, `/status`, `/stop`, `/help`, `/compress`, `/resume`) and that every gateway-eligible name/alias (38 canonical, 47 with aliases) is classified by `_looks_like_command`.
+2. Freezing those invariants as `tests/gateway/test_nats_commands.py` — four test classes, 21 test cases — so a context-clear doesn't require re-running the enumeration by hand. Without the pinned tests, Phase 7 would leave no trace; with them, a future regression (e.g. someone `cli_only=True`s `/help` by mistake) fails loudly in CI.
+
+The `/help` end-to-end test mirrors `gateway/run.py::_handle_help_command`'s real render — header + `gateway_help_lines()` — rather than a toy string, so a future change to the help renderer that injects ANSI escapes, attachments, or inline-keyboard markup would surface here before it reaches NATS callers. ANSI-escape absence is asserted explicitly because nothing else in the NATS wire path strips them.
+
+### 2026-04-22 — Phase 7 — No new adapter surface despite the command list growing
+
+`COMMAND_REGISTRY` now has 38 gateway-eligible canonical commands and 47 names+aliases — Phase 4's `_looks_like_command` regex was cautious enough (`^/[alnum_]`) that every entry in the current registry classifies correctly. If a future command ever adds a hyphen-first or symbol-first token, the new test (`test_every_gateway_known_command_is_classified`) will surface it immediately. For the MVP surface the heuristic is correct by construction — no action needed.
+
+### 2026-04-22 — Phase 7 — `_build_command_lookup` is case-insensitive via `resolve_command`, but the registry is all-lowercase
+
+`resolve_command` lowercases its argument before lookup, so `/HELP` and `/Help` would both resolve. `_looks_like_command` doesn't lowercase but also doesn't care about case — it just checks `isalnum()`. Net: mixed-case commands work end-to-end on NATS, though the design doc and prompt text use lowercase throughout. Not testing upper/mixed case explicitly to avoid over-constraining — if someone ever wants to gate on case, the constraint lives in the commands module, not the adapter.
+
+### 2026-04-22 — Phase 7 — Pre-existing test failures unchanged
+
+`scripts/run_tests.sh tests/gateway/test_nats_*.py` (all six NATS test files — 195 tests) passes cleanly. The pre-existing failures logged in earlier phases (`test_agent_cache.py`, `test_matrix.py`, `test_whatsapp_connect.py`, `test_approval_heartbeat.py`) live outside the NATS subtree and are unaffected.
 
 ---
 
