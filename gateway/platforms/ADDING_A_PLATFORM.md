@@ -53,6 +53,7 @@ The adapter is a subclass of `BasePlatformAdapter` from `gateway/platforms/base.
 | `send_video(chat_id, path, caption)` | Send a video |
 | `send_animation(chat_id, path, caption)` | Send a GIF/animation |
 | `send_image_file(chat_id, path, caption)` | Send image from local file |
+| `request_interaction(chat_id, prompt, *, kind, timeout)` | Ask the caller mid-stream and return their reply. Used for dangerous-command approval over transports that have a native request/reply query channel (e.g. NATS `stream.ask`). Default raises `NotImplementedError`; the gateway's `_approval_notify_sync` detects capability via `type(adapter).request_interaction is not BasePlatformAdapter.request_interaction` and falls back to the legacy text-reply flow for adapters that don't override. Canonical implementation: `gateway/platforms/nats.py::NatsAdapter.request_interaction`. |
 
 ### Required function
 
@@ -72,6 +73,52 @@ def check_<platform>_requirements() -> bool:
 - Redact sensitive identifiers (phone numbers, tokens) in all log output
 - Implement reconnection with exponential backoff + jitter for streaming connections
 - Set `MAX_MESSAGE_LENGTH` if the platform has message size limits
+
+### Streaming model: edit-based vs. adapter-owned `AIAgent`
+
+The default path runs text prompts through `GatewayStreamConsumer`, which buffers deltas and calls `adapter.edit_message()` to progressively replace one chat message. That fits Telegram / Slack / Discord / Matrix. Transports where every delta is a separate publish (NATS, SSE in `api_server`) don't want edits — they want **each delta emitted as its own wire frame**.
+
+If your transport is in the second category:
+
+- Set `SUPPORTS_MESSAGE_EDITING = False` as a class attribute — `gateway/run.py` short-circuits `GatewayStreamConsumer` construction when this is False.
+- Own `AIAgent` construction inside the adapter. `gateway/platforms/api_server.py` is the reference; `gateway/platforms/nats.py::_run_text_prompt` + `_run_agent_sync` are the most recent example.
+- Register a per-handler `stream_delta_callback` that feeds an `asyncio.Queue`, and drain the queue with a pump task that publishes each delta.
+- Attachment enrichment runs in `_handle_message` on the default path. If you're bypassing `handle_message()` for text prompts, replicate the enrichment inline on the adapter hot path — see `NatsAdapter._enrich_event_with_media` (inline `vision_analyze` + bracketed document/audio notes; matches the `GatewayRunner._enrich_message_with_vision` template byte-for-byte). If you skip this, the agent will never see uploaded media — images/docs attached to the envelope silently vanish after caching.
+
+### Approval / mid-stream interaction wiring (adapter-owned agent path)
+
+`_approval_notify_sync` registers its hook via `register_gateway_notify(session_key, cb)` inside the **default** `handle_message()` path (`gateway/run.py:9993`). Adapters that own their own `AIAgent` and bypass `handle_message` for text prompts **also bypass that registration** — approval callbacks from the agent thread will find no registered notify and hang on `entry.event.wait()` until the framework timeout (default 300 s).
+
+Fix if you're using the adapter-owned pattern:
+
+1. Register your own `register_gateway_notify(session_key, cb)` at `_run_agent_sync` entry, and unregister it in the `finally` block.
+2. Call `set_current_session_key(session_key)` **on the executor thread** at entry, and `reset_current_session_key(token)` in `finally`. `asyncio.loop.run_in_executor()` does NOT propagate contextvars by default, so the session-key contextvar that tools see (e.g. `tools/approval.py::get_current_session_key()`) must be set explicitly inside the worker thread.
+3. If you implement `request_interaction`, use `gateway/platforms/base.py::dispatch_approval_via_request_interaction` to route the callback — it handles the prompt formatting, scheduled-coroutine lifecycle, reply parsing, and `resolve_gateway_approval` call in lockstep with the default path, including the entry-id path for parallel subagents.
+4. Synchronously capture `get_current_approval_entry_id()` in the notify callback **before** scheduling async work. The contextvar is set on the agent's worker thread; the coroutine scheduled via `asyncio.run_coroutine_threadsafe` starts with a fresh context and can't read it. Pass the captured id through to `resolve_gateway_approval(entry_id=…)` so parallel subagents route their replies to the right entry rather than FIFO-popping.
+
+### Contextvar propagation across threads
+
+`asyncio.run_coroutine_threadsafe(coro, loop)` creates a fresh context on the target loop — **no contextvars set on the calling thread are visible inside the scheduled coroutine**. This is the default behavior and won't change upstream. Three places this surfaces in the gateway:
+
+- Session-key contextvar (`tools/approval.py`) → required explicitly on both sides when crossing threads.
+- Approval entry-id contextvar (`tools/approval.py`) → capture sync **before** scheduling, close over the captured value.
+- Any adapter-local contextvar you add (e.g. `NatsAdapter._current_stream`) → same rule.
+
+Conversely, `gateway/run.py::_run_in_executor_with_context` uses `copy_context()` to propagate context **into** executor threads. That direction works; the `run_coroutine_threadsafe` direction does not. Mixing sync worker threads with async loops without respecting this will surface as "works in unit tests, hangs in integration."
+
+### Per-session serialization (structural race elimination)
+
+If your transport supports multiple concurrent prompts per session (e.g. NATS's `x-session` field lets multiple callers target the same session string simultaneously), a per-session `asyncio.Lock` inside the adapter eliminates entire classes of races structurally — concurrent-handler stream-registration overwrites, notify-callback overwrites, ambiguous contextvar fallbacks — by making the concurrent state impossible rather than reconciling it correctly.
+
+Canonical pattern (`NatsAdapter`):
+
+- `_session_locks: dict[str, asyncio.Lock]` keyed on the per-session identifier (`chat_id`).
+- `setdefault` for lock creation — one atomic dict op under the GIL, no await between check and insert.
+- Acquire the lock **after** keep-alive emission starts (a queued handler should still signal liveness to the caller) and **after** envelope/attachment decoding (malformed inputs should fail fast, not queue).
+- Clear `_session_locks` in `disconnect()` / teardown so reconnects don't inherit locks held by cancelled tasks.
+- Distinct session ids still run in parallel — the lock is per-session, not global.
+
+Prefer this over per-send disambiguation (contextvar priority, compound-key registries, closure-captured streams) when the concurrency itself isn't load-bearing. A test that asserts "two overlapping handlers each route their send to the right stream" becomes **structurally impossible under serialization** — the interleaved sequence deadlocks — and the replacement test asserts the stronger timeline invariant (A enter → A leave → B enter → B leave).
 
 ---
 
@@ -98,7 +145,8 @@ if your_token:
 ```
 
 Update `get_connected_platforms()` if your platform doesn't use token/api_key
-(e.g., WhatsApp uses `enabled` flag, Signal uses `extra` dict).
+(e.g., WhatsApp uses `enabled` flag, Signal uses `extra` dict, NATS requires
+`enabled AND (servers OR context)`).
 
 ---
 
@@ -132,6 +180,20 @@ platform_allow_all_map = {
 }
 ```
 
+### Transport-layer auth: early-return instead of per-user allowlist
+
+Some transports delegate authorization to the transport layer itself (HMAC
+signatures for webhooks, HASS_TOKEN for Home Assistant, NATS accounts / NKey /
+JWT / TLS for NATS). These platforms **skip the allowlist check** entirely —
+add them to the `(Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.NATS)`
+tuple in the early-return branch of `_is_user_authorized` instead of wiring
+them into `platform_env_map` / `platform_allow_all_map`.
+
+Failing to add a transport-authed platform to the early-return tuple causes a
+subtle bug: inbound messages are treated as anonymous / un-paired users and
+the bot replies with a pairing code instead of executing the command.
+Regression test pattern: `tests/gateway/test_unauthorized_dm_behavior.py::test_nats_is_authorized_without_user_allowlist`.
+
 ---
 
 ## 5. Session Source (`gateway/session.py`)
@@ -158,6 +220,13 @@ PLATFORM_HINTS = {
 
 Without this, the agent won't know it's on your platform and may use
 inappropriate formatting (e.g., markdown on platforms that don't render it).
+The `PLATFORM_HINTS` entry is only reached when the adapter routes text
+prompts through `handle_message()` → `_build_system_prompt()`. Adapters that
+own their own `AIAgent` construction (§1 "Streaming model: adapter-owned
+AIAgent") also bypass the hint injection unless they explicitly thread
+`platform` into their `AIAgent()` call — add the hint anyway for the default
+path, and wire `platform="your_platform"` into the adapter's agent
+construction so the hint is applied regardless of path.
 
 ---
 
@@ -181,6 +250,22 @@ And add it to the `hermes-gateway` composite:
 }
 ```
 
+**Both steps are required.** Forgetting the `hermes-gateway` includes line is
+easy to miss because the platform-specific tests still pass, but
+`tests/hermes_cli/test_tools_config.py::TestPlatformToolsetConsistency::test_gateway_toolset_includes_all_messaging_platforms`
+will fail. This test is cheap (<1 s) — run it as part of your phase close,
+not just your adapter-file subset:
+
+```bash
+scripts/run_tests.sh tests/hermes_cli/test_tools_config.py
+```
+
+The NATS adapter shipped three phases with this line missing because the
+NATS-only subset never exercised it; Phase 8's first full-suite run caught it.
+Registering any toolset name (platform or otherwise) is a cross-module surface
+— run the consistency test whenever you touch `toolsets.py`, `PLATFORMS` in
+`hermes_cli/platforms.py`, or the `Platform` enum.
+
 ---
 
 ## 8. Cron Delivery (`cron/scheduler.py`)
@@ -195,6 +280,14 @@ platform_map = {
 ```
 
 Without this, `cronjob(action="create", deliver="your_platform", ...)` silently fails.
+
+**Skip this step** if your transport is request/reply only (no server-initiated
+delivery). Cron delivery requires the adapter to publish to a persistent
+address that exists between prompts — a chat ID, room, email address, etc. For
+pure request/reply transports like NATS (where the "reply subject" exists only
+for the duration of one prompt and vanishes when the caller's iterator exits),
+cron delivery has no meaningful destination and is correctly omitted. The
+NATS adapter is absent from `cron/scheduler.py::_deliver_result` by design.
 
 ---
 
@@ -222,6 +315,11 @@ and the send_message tool outside the gateway process).
 
 Update the tool schema `target` description to include your platform example.
 
+**Skip this step** if your transport is request/reply only (same reasoning as
+§8). The `send_message` tool ships a fresh message to a persistent address;
+request/reply transports have no such address. The NATS adapter omits
+`send_message_tool` routing by design.
+
 ---
 
 ## 10. Cronjob Tool Schema (`tools/cronjob_tools.py`)
@@ -239,6 +337,10 @@ session-based discovery list:
 ```python
 for plat_name in ("telegram", "whatsapp", "signal", "your_platform"):
 ```
+
+**Skip this step** for pure request/reply transports where "channels" are
+transient (one reply subject per prompt, no persistence). NATS is absent from
+the channel directory by design.
 
 ---
 

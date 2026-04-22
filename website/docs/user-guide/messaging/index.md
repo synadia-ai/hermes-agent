@@ -1,7 +1,7 @@
 ---
 sidebar_position: 1
 title: "Messaging Gateway"
-description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Yuanbao, Microsoft Teams, Webhooks, or any OpenAI-compatible frontend via the API server — architecture and setup overview"
+description: "Chat with Hermes from Telegram, Discord, Slack, WhatsApp, Signal, SMS, Email, Home Assistant, Mattermost, Matrix, DingTalk, Yuanbao, NATS, Microsoft Teams, Webhooks, or any OpenAI-compatible frontend via the API server — architecture and setup overview"
 ---
 
 # Messaging Gateway
@@ -33,6 +33,7 @@ For the full voice feature set — including CLI microphone mode, spoken replies
 | QQ | ✅ | ✅ | ✅ | — | — | ✅ | — |
 | Yuanbao | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
 | Microsoft Teams | — | ✅ | — | ✅ | — | ✅ | — |
+| NATS | — | ✅ | ✅ | — | — | — | ✅ |
 
 **Voice** = TTS audio replies and/or voice message transcription. **Images** = send/receive images. **Files** = send/receive file attachments. **Threads** = threaded conversations. **Reactions** = emoji reactions on messages. **Typing** = typing indicator while processing. **Streaming** = progressive message updates via editing.
 
@@ -61,6 +62,7 @@ flowchart TB
     qq[QQ]
     yb[Yuanbao]
     ms[Microsoft Teams]
+    nats[NATS]
     api["API Server<br/>(OpenAI-compatible)"]
     wh[Webhooks]
         end
@@ -89,6 +91,7 @@ flowchart TB
     qq --> store
     yb --> store
     ms --> store
+    nats --> store
     api --> store
     wh --> store
     store --> agent
@@ -398,6 +401,7 @@ Each platform has its own toolset:
 | QQBot | `hermes-qqbot` | Full tools including terminal |
 | Yuanbao | `hermes-yuanbao` | Full tools including terminal |
 | Microsoft Teams | `hermes-teams` | Full tools including terminal |
+| NATS | `hermes-nats` | Full tools including terminal (programmatic agent protocol, no interactive UI tools) |
 | API Server | `hermes` (default) | Full tools including terminal |
 | Webhooks | `hermes-webhook` | Full tools including terminal |
 
@@ -422,5 +426,6 @@ Each platform has its own toolset:
 - [QQBot Setup](qqbot.md)
 - [Yuanbao Setup](yuanbao.md)
 - [Microsoft Teams Setup](teams.md)
+- [NATS Setup](nats.md)
 - [Open WebUI + API Server](open-webui.md)
 - [Webhooks](webhooks.md)

@@ -20,8 +20,8 @@ Do not rewrite the design doc unless the user asks. If a design decision turns o
 
 ## Status
 
-- **Last completed phase:** Phase 8 — End-to-end verification (all eight T8.* live-verified against a local nats-server + OpenRouter-backed model)
-- **Next phase:** Phase 9 — Polish & docs (T9.1, T9.2, T9.3)
+- **Last completed phase:** Phase 9 — Polish & docs (T9.1 ADDING_A_PLATFORM.md refresh, T9.2 design-doc §17 "Lessons learned", T9.3 user-facing `nats.md` + messaging-index wiring + env-var reference)
+- **Next phase:** None — all phases complete. PR on `nats-gateway` → `main` is the next human step.
 - **Branch:** `nats-gateway` (feature branch; PR target is `main`)
 - **Known blockers:** none
 - **Open design questions pending user input:** 4 items listed in §16 of `docs/nats-gateway-design.md`. Default answers are noted there; proceed with defaults unless the user redirects.
@@ -103,9 +103,9 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 
 ### Phase 9 — Polish & docs
 
-- [ ] **T9.1** — Update `gateway/platforms/ADDING_A_PLATFORM.md` with any new integration points that emerged (e.g. `request_interaction` if it gets generalized)
-- [ ] **T9.2** — Append "Lessons learned" section to `docs/nats-gateway-design.md` (especially surprises in stream_delta_callback wiring or attachments)
-- [ ] **T9.3** — Add example config snippet to README or new `docs/nats-gateway.md` (user-facing)
+- [x] **T9.1** — Update `gateway/platforms/ADDING_A_PLATFORM.md` with any new integration points that emerged (e.g. `request_interaction` if it gets generalized)
+- [x] **T9.2** — Append "Lessons learned" section to `docs/nats-gateway-design.md` (especially surprises in stream_delta_callback wiring or attachments)
+- [x] **T9.3** — Add example config snippet to README or new `docs/nats-gateway.md` (user-facing)
 
 ---
 
@@ -608,7 +608,48 @@ Phase 4 regressions caught and fixed during Phase 8:
 
 Proceed to Phase 9 — Polish & docs.
 
----
+### 2026-04-22 — Phase 9 — T9.1 ADDING_A_PLATFORM.md refresh scope
+
+Expanded beyond a minimal `request_interaction` row. The NATS adapter introduced four separate integration patterns that weren't previously documented and that future platform authors would otherwise have to re-discover:
+
+1. Optional `request_interaction` method in the methods table (capability-gated approval hook).
+2. "Streaming model" subsection in §1 contrasting edit-based (Telegram/Slack/Discord) vs. adapter-owned `AIAgent` (api_server/NATS), pointing at `SUPPORTS_MESSAGE_EDITING = False` + the reason.
+3. "Approval wiring for adapter-owned agent path" subsection enumerating the four things an adapter-owned-AIAgent path must do that `_handle_message`'s default wiring does for free (register_gateway_notify, set_current_session_key on the executor thread, use `dispatch_approval_via_request_interaction`, sync-capture `get_current_approval_entry_id()` before scheduling).
+4. "Contextvar propagation across threads" + "Per-session serialization" subsections capturing the §17.1 and §17.2 lessons-learned rules in actionable form.
+
+Also added transport-layer-auth guidance to §4 (pointing at `_is_user_authorized`'s early-return tuple for Webhook/HASS/NATS), a "skip this step for request/reply transports" note to §8 (cron delivery), §9 (send_message tool), and §11 (channel directory), and hardened §7 with the `tests/hermes_cli/test_tools_config.py` consistency-test requirement (caught the Phase 4 `hermes-nats → hermes-gateway` miss in Phase 8).
+
+Trade-off considered and rejected: writing a separate "adapter patterns" document would have been cleaner but split the authoritative checklist. Adding subsections inline keeps the checklist as the single landing page for platform authors — one file to read, one file to keep synced.
+
+### 2026-04-22 — Phase 9 — T9.2 lessons-learned section scope
+
+Wrote §17 as 12 subsections, each with a **Generalizable rule** line so the lesson applies beyond NATS. Mapped each lesson back to the originating decision-log entry in this file. Key lessons distilled:
+
+- §17.1 `asyncio.run_coroutine_threadsafe` does not propagate contextvars — three Phase 6 bugs had this single root cause.
+- §17.2 Prefer structural elimination of races over reconciling them — per-session `asyncio.Lock` made two Phase 6 races structurally impossible.
+- §17.3 Adapter-owned `AIAgent` bypasses more of the gateway than it looks — the Phase 8 `media_urls`-drop and approval-notify-not-registered gaps are the canonical examples.
+- §17.4 Keep cross-adapter user-message shape identical — Phase 8's note-injection → canonical `_enrich_message_with_vision` template refactor.
+- §17.5 Cross-module registration surfaces need consistency tests in the phase-close gate — Phase 4's `hermes-gateway includes` miss survived three phases.
+- Plus §17.6-17.12 covering notify-cb-is-sync implications, canonical attachment enrichment, per-session locks, private-attribute peek, entry-id threading for parallel subagents, full-suite gate policy, and the non-event that prompt caching stayed well-behaved.
+
+### 2026-04-22 — Phase 9 — T9.3 put the setup guide in website/docs, not repo-root
+
+The task's alternate phrasing ("Add example config snippet to README or new `docs/nats-gateway.md`") was ambiguous about location. The `ADDING_A_PLATFORM.md` §15 convention is `website/docs/user-guide/messaging/<platform>.md` for the full setup guide — matches every other platform doc. Implemented both:
+
+- `website/docs/user-guide/messaging/nats.md` — full user-facing setup guide (config options, examples, security model, troubleshooting, non-goals, reference links).
+- `docs/nats-gateway.md` — short developer-facing pointer that links the website doc + design + progress + protocol spec + SDK. Keeps the repo-root `docs/` layout coherent (three files: design, progress, this pointer).
+
+Also updated:
+
+- `website/docs/user-guide/messaging/index.md` — added NATS to the Platform Comparison table, architecture diagram, Platform-Specific Toolsets table, Next Steps list, and the description frontmatter.
+- `website/docs/reference/environment-variables.md` — added a NATS block (`NATS_URL`, `NATS_CONTEXT`, `HERMES_NATS_{AGENT,OWNER,NAME,SESSION}`) before the WEBHOOK block.
+- `CLAUDE.md` — replaced the "(in progress)" section with a permanent "NATS gateway channel" entry pointing at the three docs + SDK install instruction. Also noted the NATS adapter as the canonical example in-tree for adapter-owned `AIAgent` + per-session lock + `request_interaction`.
+
+Deliberately did NOT update the README's platform lists (lines 20 / 58 / 69 / 96) — those are conversational "chat with Hermes from X" summaries and NATS is a programmatic protocol channel rather than a chat app. Mentioning it there would mislead rather than inform. The messaging docs section is the right landing surface.
+
+### 2026-04-22 — Phase 9 — Phase 9 closed
+
+Phase 9 is docs-only — no code changes. Full NATS test subtree re-run (203/203 green in ~3 s) confirms the code surface wasn't accidentally touched during the doc pass. Ready for PR on the `nats-gateway` branch.
 
 ## Task definitions reference
 

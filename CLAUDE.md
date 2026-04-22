@@ -146,13 +146,16 @@ When building a new messaging platform adapter (e.g. a NATS channel), follow `ga
 
 Canonical adapter to copy from: `gateway/platforms/telegram.py` — it uses `acquire_scoped_lock()`/`release_scoped_lock()` from `gateway.status` correctly and is the reference pattern for profile-safe credentialed adapters.
 
-### NATS gateway channel (in progress)
+### NATS gateway channel
 
-A NATS gateway channel is being implemented phase-by-phase across context-cleared sessions. If you are working on this:
+The NATS gateway channel is implemented at `gateway/platforms/nats.py`. Key references:
 
-- `docs/nats-gateway-design.md` is the architectural reference — protocol↔adapter mapping, streaming model, session identity, lock scope, approval hook design, failure modes. Read it before touching NATS code.
-- `docs/nats-gateway-progress.md` tracks status (last completed phase, next phase, task checklist, decision log). Read it to find out where to resume. Follow its end-of-phase ritual.
-- Agent-side SDK: `natsagent` at `../nats-ai-pysdk` (package `natsagent`). It wraps micro-service registration, heartbeats, chunk wrapping, terminators, error headers, and mid-stream `stream.ask()` automatically. Protocol spec: `../nats-ai-pysdk/docs/nats-agent-protocol.md`.
+- `docs/nats-gateway-design.md` is the architectural reference — protocol↔adapter mapping, streaming model, session identity, lock scope, approval hook design, failure modes. §17 of that doc captures the retrospective lessons learned during implementation (contextvar-through-`run_coroutine_threadsafe` pitfalls, structural race elimination via per-session serialization, adapter-owned-`AIAgent` side-effect audit, canonical user-message templates). Read it before touching NATS code.
+- `docs/nats-gateway-progress.md` is the phase-by-phase progress log (completed through Phase 9). The decision log at the bottom captures non-obvious moment-of-landing context that the design doc alone doesn't cover.
+- `docs/nats-gateway.md` points to the user-facing setup guide at `website/docs/user-guide/messaging/nats.md`.
+- Agent-side SDK: `natsagent` at `../nats-ai-pysdk` (package `natsagent`). It wraps micro-service registration, heartbeats, chunk wrapping, terminators, error headers, and mid-stream `stream.ask()` automatically. Protocol spec: `../nats-ai-pysdk/docs/nats-agent-protocol.md`. Until it ships on PyPI, install with `uv pip install --python venv/bin/python -e ../nats-ai-pysdk`.
+
+The NATS adapter is the canonical example in the codebase of an **adapter-owned `AIAgent`** (api_server-style, not `handle_message`-routed) + **per-session `asyncio.Lock` serialization** + **`request_interaction` approval hook**. If you're building another transport with the same shape (programmatic request/reply, non-edit-based streaming), copy patterns from `nats.py`, not `telegram.py`.
 
 ## Scratch directory: `RENE/`
 

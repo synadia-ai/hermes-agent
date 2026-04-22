@@ -663,3 +663,101 @@ Open for reviewer input:
 2. Should the adapter register a single `Agent` or one per active `x-session`? (Recommendation: single; rationale in §13(9).)
 3. Do we expose `ack_keepalive_interval_s` in config, or hard-code? (Recommendation: expose, with 20 s default.)
 4. Do we want a metric/log for "prompt received but session mismatched expectations" (e.g. envelope-parse failures with JSON-looking body)? (Recommendation: log at warning; no metric in MVP.)
+
+---
+
+## 17. Lessons learned (written post-MVP)
+
+This section is intentionally written in past tense, as a retrospective. Each lesson maps back to a decision-log entry in `docs/nats-gateway-progress.md` if you want the moment-of-landing context. Listed roughly in order of broadest applicability → most NATS-specific.
+
+### 17.1 Contextvars do not cross `run_coroutine_threadsafe` boundaries
+
+`asyncio.run_coroutine_threadsafe(coro, loop)` schedules `coro` into a **fresh** context on the target loop. Every contextvar set on the calling thread is invisible inside `coro`. Three separate Phase 6 bugs were the same bug under different names:
+
+- The stream-resolution contextvar (`_current_stream`) set in `_on_prompt` was unreadable from inside the coroutine that the approval-notify callback scheduled on the gateway loop.
+- The session-key contextvar (`set_current_session_key`) set on the gateway's async side was unreadable from the executor thread running `run_conversation`.
+- The approval-entry-id contextvar (`_current_approval_entry_id`) set by `check_all_command_guards` on the agent thread was unreadable inside the coroutine scheduled by the adapter's notify callback.
+
+Fixes in all three cases were identical in shape: **capture the contextvar value synchronously on the calling side, before scheduling; pass the captured value explicitly through the closure**. `gateway/run.py::_run_in_executor_with_context` uses `copy_context()` to propagate context **into** executor threads — that direction works. There is no `copy_context()` analog for `run_coroutine_threadsafe` and upstream has no plans to add one.
+
+**Generalizable rule.** Any sync→async or async→sync handoff that isn't `asyncio.create_task` on the same loop is a contextvar boundary. Treat it as the default assumption when planning approval, streaming, or tool-dispatch flows that cross threads.
+
+### 17.2 Prefer structural elimination of races over reconciling them
+
+Phase 5's T5.0 shipped a contextvar-primary + compound-key-dict hybrid for concurrent same-session stream lookup. It was correct under most scenarios but fragile — e.g. sends scheduled across `run_coroutine_threadsafe` boundaries fell through to the dict-lookup fallback, which was order-dependent when multiple streams shared a `chat_id`. Phase 6 initially stacked a second reconciliation layer on top (closure-captured streams inside notify callbacks) and a third (`register_gateway_notify` overwrite semantics).
+
+The third attempt replaced all of it with a per-`chat_id` `asyncio.Lock`: at most one handler per session at any instant, so stream-ambiguity and callback-overwrite both became structurally impossible. The Phase 5 T5.0 regression test — which manually gated two handlers to overlap and asserted each send reached its own stream — became **deadlock-by-design under serialization** and was rewritten as a timeline-ordering assertion (A enter → A leave → B enter → B leave).
+
+**Generalizable rule.** When a correctness bug has the shape "multiple concurrent things of type X share state Y," serialize the entry to X before reconciling Y correctly. Losing a test that exercises "race-safe" machinery in favor of a test that exercises "no race possible" is a win. The opposite direction — retrofitting serialization after building reconciliation — is much more expensive because the reconciliation machinery spreads across the code.
+
+### 17.3 Adapter-owned `AIAgent` bypasses more of the gateway than it looks
+
+The api_server pattern (own the agent, feed a stream_delta_callback into a queue) was the right architectural call for NATS (§6.1). But every time the adapter sidesteps `GatewayRunner._handle_message()`, something that runs inside the default path silently stops running. In Phase 8, two separate gaps surfaced after the adapter was already shipping:
+
+- Media enrichment (`_enrich_message_with_vision` + document/audio context notes) ran in `_handle_message`, not in the adapter. Without it, uploaded images were cached but never mentioned to the agent — the agent literally replied "I don't see an image attached" on a PNG round-trip. Fix: `NatsAdapter._enrich_event_with_media` replicates the canonical template byte-for-byte.
+- Approval-notify registration (`register_gateway_notify` inside the async side of `_handle_message`) didn't run for the adapter-owned path. Without it, dangerous-command approvals hung the agent thread for the 300 s framework timeout. Fix: adapter-local `register_gateway_notify` inside `_run_agent_sync`.
+
+**Generalizable rule.** When designing an adapter that bypasses `handle_message`, audit every side effect that `_handle_message` triggers before the `AIAgent.run_conversation` call — media enrichment, approval registration, system-prompt hint injection, session-source threading, whatever. Each is a latent gap unless replicated on the adapter hot path. The symptom is always the same: "works in unit tests, caller observes feature silently absent in integration."
+
+### 17.4 Keep cross-adapter user-message shape identical
+
+Phase 8's first-pass fix for dropped media_urls used a bracketed note pointing the agent at `vision_analyze` for the user to call itself. It worked for the MVP §8.1 contract but diverged from every other platform's behavior. The refactor that followed adopted the canonical template verbatim (inline `vision_analyze` → description injected into user_message with the exact same wording Telegram / Discord / Slack use).
+
+Reason: any downstream behavior that assumes a consistent user-message shape — skill prompts, conversation-history replay, session migration across platforms, memory formation — silently miscomputes if one platform's messages look different from the others. "Works on Telegram, broken on NATS" is a whole class of future bugs; matching byte-for-byte removes it.
+
+**Generalizable rule.** Adapter hot-path transformations of the user-facing message are the right place for platform-specific behavior (formatting, attachment handling, emoji policy). Adapter-side construction of the agent-facing message should remain indistinguishable across adapters unless the platform genuinely exposes richer structure.
+
+### 17.5 Cross-module registration surfaces need consistency tests in the phase-close gate
+
+The `hermes-nats` toolset existed in `toolsets.py`'s `TOOLSETS["hermes-nats"]` and in `hermes_cli/platforms.py`'s `PLATFORMS` map from Phase 4 onward, but was missing from the `TOOLSETS["hermes-gateway"]["includes"]` aggregator list. The gap survived three subsequent phases because each phase's file-targeted test subset (`scripts/run_tests.sh tests/gateway/test_nats_*.py`) didn't exercise the consistency test that lives in a different subtree (`tests/hermes_cli/test_tools_config.py`).
+
+**Generalizable rule.** Running the full suite every phase is overkill at 14k+ tests and 4 min wall time per cycle. But whenever a phase touches a cross-module **registration point** — a `Platform` enum value, a toolset name, an env var the factory reads, a platform label in the CLI registry — run the consistency test for that surface before closing the phase. For platforms specifically, `scripts/run_tests.sh tests/hermes_cli/test_tools_config.py` is <1 s and would have caught the miss.
+
+### 17.6 `notify_cb` is sync and can fire multiple times per session
+
+`tools/approval.py::register_gateway_notify` wires `cb(approval_data: dict) -> None`. The registered callback runs on the agent's worker thread, synchronously, and is expected to return quickly so the agent thread can proceed to `entry.event.wait()`. Three implications caused bugs during Phase 6:
+
+1. Any async work from the callback has to cross threads via `run_coroutine_threadsafe` — which re-enters §17.1's contextvar problem.
+2. A single callback registration can be invoked multiple times per session (parallel subagents fan out from one `delegate_tool` call). Per-invocation state must live in `approval_data`, not a closure over the registration.
+3. Every path through the callback must eventually unblock the waiting entry. Either via the scheduled async work that calls `resolve_gateway_approval`, or by calling `resolve_gateway_approval(session_key, "deny")` directly on failure. Missing this made one dispatch-failure scenario hang the agent for the full 300 s `gateway_timeout` before the framework surfaced it as "deny" anyway — same outcome, 300 s → ~0 ms after the fix.
+
+### 17.7 Attachment enrichment was a canonical-template match, not a design trade-off
+
+The first-pass media-enrichment fix (adapter-local bracketed notes pointing the agent at `vision_analyze`) was cheaper to ship than inline vision pre-analysis — one round-trip saved per image if the agent chose not to call the tool. It was rejected on the review pass because *every other adapter* inline-pre-analyzes images via `_enrich_message_with_vision`, and the consistency of the user-message shape matters more than the per-request latency.
+
+The lesson compounds §17.4: if there's a canonical template for a side effect that every platform shares, adopting it verbatim is almost always the right call, even when a locally-cheaper alternative looks viable. The cost of "this adapter behaves subtly differently from the others" accumulates in every downstream feature.
+
+### 17.8 Per-session `asyncio.Lock` for a "request/reply" transport that supports concurrent sessions
+
+NATS's protocol is "request/reply" at a message level, but two callers can target the same `x-session` string simultaneously. Our MVP's single-registration-per-Hermes-instance choice (§13(9)) compresses that into one adapter handling both concurrent prompts. Per-session serialization (§17.2) turned out to be the minimum-viable correctness story here — the same approach would apply to any transport where "session" is a caller-supplied field rather than a transport-enforced identifier.
+
+Design choices that ended up load-bearing:
+
+- Keep-alive starts *before* the lock: a queued handler still emits `status:ack` chunks so the caller doesn't hit §6.6's inactivity timeout.
+- `_unpack_envelope` runs *before* the lock: attachment decode failures fail fast with an SDK 500, not blocked behind a busy-session queue.
+- `_session_locks` is cleared in `_teardown_handles()`: reconnects don't inherit locks held by cancelled tasks.
+- Distinct `chat_id`s still run in parallel: the lock is per-session, not global.
+
+### 17.9 Private-attribute peek (stream._request.data) is an acceptable MVP crutch
+
+Design doc §3 flagged option (b) — peeking the SDK's `stream._request.data` to extract `x-session` before the SDK's `Envelope` decoder drops the field per `extra="ignore"`. It was shipped and stayed private-attribute-dependent through Phase 8. The failure mode is loud (AttributeError at handler entry) and confined (falls back to session default), which makes it a defensible MVP crutch rather than a landmine.
+
+The cleaner long-term fix is an upstream change to `nats-ai-pysdk` exposing raw bytes on the handler signature. Non-trivial to upstream, and Phase 8's verification shows the private-access approach works reliably in practice. Filing as follow-up rather than a blocker is the right call.
+
+### 17.10 `entry_id` threading for parallel subagents fits under the "structural" umbrella
+
+Same shape as §17.2 but scoped to within a single adapter handler. Parallel subagents (`delegate_tool`) can each produce a dangerous-command approval that fires the shared `notify_cb`. FIFO-pop semantics in `resolve_gateway_approval` made replies racy — reply-for-B could land on entry-A if A was still pending.
+
+Per-session serialization can't eliminate this race because the subagents are inside one handler (same `chat_id`, same lock already held). Instead, a uuid `id` on each `_ApprovalEntry` + a `_current_approval_entry_id` contextvar lets the adapter capture the id synchronously in the notify callback and pass it through `resolve_gateway_approval(entry_id=…)` to resolve the *correct* entry by match rather than order. Fully backwards-compatible — other adapters resolve without an id and fall through to FIFO.
+
+**Generalizable rule.** When "structural elimination" isn't available because the concurrency is a feature rather than a leak, the next best thing is a precise identity on the thing being resolved and a way to capture it at the correct moment in the flow. Both are cheap; the tricky part is noticing you need them.
+
+### 17.11 "Verify against the full suite" is a concrete phase-close gate, not a formality
+
+Restating §17.5 as policy. Phases 1–7's phase-close ritual used `scripts/run_tests.sh tests/gateway/test_nats_*.py` and declared phase done on green. Phase 4's `hermes-nats` → `hermes-gateway` aggregator miss survived three phases that way. Phase 8's T8.8 caught it because T8.8 explicitly requires the full suite.
+
+The fix isn't "run the full suite every phase" — it's "when a phase touches a cross-module registration point, run the consistency test for that surface." Specific to hermes-agent: `scripts/run_tests.sh tests/hermes_cli/test_tools_config.py` for any toolset / `Platform` enum / `PLATFORMS` map change. Cheap insurance, <1 s.
+
+### 17.12 Surprise that did not surface: cache-friendly streaming over a chunked transport
+
+The design doc's §12 testing strategy and the prompt-caching concerns in `CLAUDE.md` warn against mutating past context mid-conversation. The adapter-owned `AIAgent` path was built assuming it would interact with prompt caching the same way CLI and api_server do — and it did. No surprises here despite the concern at Phase 0. Worth mentioning explicitly: the adapter's streaming loop doesn't touch `AIAgent` message history, so cache invariants hold transitively.
