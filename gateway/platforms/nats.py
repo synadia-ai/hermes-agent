@@ -1159,6 +1159,15 @@ class NatsAdapter(BasePlatformAdapter):
         # ``resolve_gateway_approval`` when the caller replies — unblocking
         # the agent thread waiting on the ApprovalEntry event.
         def _nats_approval_notify(approval_data: dict) -> None:
+            # Capture the entry id SYNCHRONOUSLY — contextvars don't
+            # propagate across ``asyncio.run_coroutine_threadsafe``, so
+            # the scheduled coroutine can only see the id via closure.
+            # Without this, ``resolve_gateway_approval`` falls back to
+            # FIFO-oldest pop, which cross-routes choices for parallel
+            # subagents hitting dangerous commands in the same session.
+            from tools.approval import get_current_approval_entry_id
+            captured_entry_id = get_current_approval_entry_id()
+
             try:
                 dispatched = dispatch_approval_via_request_interaction(
                     self,
@@ -1167,6 +1176,7 @@ class NatsAdapter(BasePlatformAdapter):
                     approval_data,
                     loop,
                     timeout=_approval_timeout_from_config(),
+                    entry_id=captured_entry_id,
                 )
             except Exception as exc:
                 logger.error(
@@ -1184,10 +1194,13 @@ class NatsAdapter(BasePlatformAdapter):
                 # so the agent thread blocked on ``entry.event.wait()``
                 # unblocks immediately instead of hanging for the full
                 # ``gateway_timeout`` (default 300 s) before the framework
-                # times out by itself.
+                # times out by itself. Pass the captured entry_id so we
+                # resolve the specific entry, not FIFO-oldest.
                 try:
                     from tools.approval import resolve_gateway_approval
-                    resolve_gateway_approval(session_key, "deny")
+                    resolve_gateway_approval(
+                        session_key, "deny", entry_id=captured_entry_id,
+                    )
                 except Exception as exc:
                     logger.error(
                         "[%s] Fallback resolve_gateway_approval failed "

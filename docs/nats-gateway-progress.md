@@ -350,11 +350,26 @@ Regression test: `TestConcurrentSameSessionRegression::test_two_handlers_one_ses
 
 `_nats_approval_notify` reads the return value of `dispatch_approval_via_request_interaction` and, when it's False (scheduling on `loop` raised — only happens during a shutdown race where the loop is already closed), immediately calls `resolve_gateway_approval(session_key, "deny")`. Without this, the agent thread blocked on `entry.event.wait()` would hang for the full `gateway_timeout` (default 300 s) before the framework's timeout surfaces with "deny" anyway. Same outcome, but 300 s → ~0 ms. Regression test: `test_notify_callback_resolves_as_deny_when_dispatch_fails`.
 
+### 2026-04-22 — Phase 6 — Entry-id path fixes parallel-subagent cross-routing
+
+User review asked whether the "entry-pop is FIFO, not reply-keyed" shortcoming could be fixed now instead of carried forward. Scope turned out surgical: extend `_ApprovalEntry` with a uuid `id`, add a `_current_approval_entry_id` contextvar that `check_all_command_guards` sets around the synchronous `notify_cb(approval_data)` call, expose `get_current_approval_entry_id()`, and add an optional `entry_id=` kwarg to `resolve_gateway_approval` that matches by id instead of popping FIFO-oldest.
+
+Adapter-side wiring: the NATS `_nats_approval_notify` (and for symmetry `run.py:_approval_notify_sync`) calls `get_current_approval_entry_id()` synchronously before scheduling the async `request_interaction` call, captures the id into the scheduled coroutine's closure, and passes it to `resolve_gateway_approval(entry_id=…)` when the reply lands. Since contextvars don't propagate through `asyncio.run_coroutine_threadsafe`, the sync capture BEFORE scheduling is the critical piece — a fresh `get_current_approval_entry_id()` call inside the scheduled coroutine would return None.
+
+Backwards-compatible by design:
+- Existing adapters (Slack, Discord, Telegram, Feishu, Matrix) call `resolve_gateway_approval(session_key, choice)` without `entry_id` → fall through to FIFO pop → zero behavioral change. All 49 button-adapter approval tests pass unchanged.
+- CLI `/approve`, `/deny`, `/approve all` paths go through `resolve_gateway_approval` without an id → FIFO + resolve_all path unchanged.
+- Unknown `entry_id` does NOT fall through to FIFO — it returns 0 and leaves the queue untouched, so a stale id can't spuriously resolve an unrelated entry (regression test `test_resolve_by_unknown_entry_id_returns_zero_without_touching_queue`).
+
+Regression tests:
+- `tests/gateway/test_approve_deny_commands.py::TestBlockingGatewayApproval::test_resolve_by_entry_id_targets_specific_entry` — id path resolves the newer entry first with its own choice, older entry still pending.
+- `tests/gateway/test_approve_deny_commands.py::test_current_entry_id_contextvar_roundtrip` — contextvar set/reset semantics.
+- `tests/gateway/test_nats_query.py::TestParallelSubagentApprovalRouting::test_out_of_order_replies_resolve_correct_entries` — two NATS streams, two entries, out-of-order replies each resolve their own entry with their own choice.
+- `tests/gateway/test_nats_query.py::TestParallelSubagentApprovalRouting::test_entry_id_none_preserves_legacy_fifo_fallback` — pins the backwards-compat behavior.
+
 ### 2026-04-22 — Phase 6 — Known shortcomings (NOT fixed; carry forward)
 
-1. **Entry-pop is FIFO, not reply-keyed.** `resolve_gateway_approval(session_key, choice)` pops the OLDEST entry from `_gateway_queues[session_key]`, not "the one matching this query reply". Session serialization eliminates the concurrent same-`x-session` case, but parallel subagents *inside one handler* still share a single `session_key` and can hit dangerous commands simultaneously. If the caller replies to query 2 before query 1, coroutine 2's `resolve_gateway_approval` pops entry 1 (FIFO oldest) with query 2's choice; entry 2 then resolves with query 1's choice → cross-routed approvals. Narrow (requires `delegate_tool` parallel execution + concurrent dangerous commands within one handler), framework-level root cause. Fix would require extending `tools/approval.py` with a `_current_entry` contextvar + a `resolve_approval_entry(entry_obj, choice)` function that matches by object identity — surgical but touches gateway-wide code. Defer to post-MVP.
-
-2. **Approval reply "a" maps to "always", not "approve once".** Consistent with the CLI's `[o]nce | [s]ession | [a]lways | [d]eny` shortcuts, but users who type "a" thinking "approve" get permanent allowlisting instead of one-time. Mitigated by the prompt text explicitly listing `once | session | always | deny` as the four options. Full words are unambiguous; only the single-letter form has this footgun.
+1. **Approval reply "a" maps to "always", not "approve once".** Consistent with the CLI's `[o]nce | [s]ession | [a]lways | [d]eny` shortcuts, but users who type "a" thinking "approve" get permanent allowlisting instead of one-time. Mitigated by the prompt text explicitly listing `once | session | always | deny` as the four options. Full words are unambiguous; only the single-letter form has this footgun.
 
 ---
 

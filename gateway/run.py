@@ -13593,16 +13593,22 @@ class GatewayRunner:
                 # fall through to the established flows below. The helper
                 # schedules the query on _loop_for_step and arranges for
                 # resolve_gateway_approval() to fire when the caller replies.
+                # Capture the current approval entry id synchronously here
+                # so the scheduled coroutine resolves the specific entry
+                # (avoids FIFO-pop cross-routing for parallel subagents).
                 try:
                     from gateway.platforms.base import (
                         dispatch_approval_via_request_interaction,
                     )
+                    from tools.approval import get_current_approval_entry_id
+                    _captured_entry_id = get_current_approval_entry_id()
                     if dispatch_approval_via_request_interaction(
                         _status_adapter,
                         _status_chat_id,
                         _approval_session_key,
                         approval_data,
                         _loop_for_step,
+                        entry_id=_captured_entry_id,
                     ):
                         return
                 except Exception as _e:

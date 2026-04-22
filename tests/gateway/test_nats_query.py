@@ -338,7 +338,7 @@ class TestDispatchApproval:
         # actually unblocks the waiting agent thread after the reply.
         resolved: list[tuple[str, str]] = []
 
-        def _fake_resolve(session_key, choice, resolve_all=False):
+        def _fake_resolve(session_key, choice, resolve_all=False, entry_id=None):
             resolved.append((session_key, choice))
             return 1
 
@@ -378,7 +378,7 @@ class TestDispatchApproval:
 
         resolved: list[tuple[str, str]] = []
 
-        def _fake_resolve(session_key, choice, resolve_all=False):
+        def _fake_resolve(session_key, choice, resolve_all=False, entry_id=None):
             resolved.append((session_key, choice))
             return 1
 
@@ -416,7 +416,7 @@ class TestDispatchApproval:
 
         resolved: list[tuple[str, str]] = []
 
-        def _fake_resolve(session_key, choice, resolve_all=False):
+        def _fake_resolve(session_key, choice, resolve_all=False, entry_id=None):
             resolved.append((session_key, choice))
             return 1
 
@@ -494,7 +494,7 @@ class TestGatewayApprovalIntegration:
         session_key = "agent:main:nats:dm:alice"
         resolved: list[tuple[str, str]] = []
 
-        def _fake_resolve(sk, choice, resolve_all=False):
+        def _fake_resolve(sk, choice, resolve_all=False, entry_id=None):
             resolved.append((sk, choice))
             return 1
 
@@ -529,7 +529,7 @@ class TestGatewayApprovalIntegration:
         session_key = "agent:main:nats:dm:alice"
         resolved: list[tuple[str, str]] = []
 
-        def _fake_resolve(sk, choice, resolve_all=False):
+        def _fake_resolve(sk, choice, resolve_all=False, entry_id=None):
             resolved.append((sk, choice))
             return 1
 
@@ -564,6 +564,159 @@ class TestGatewayApprovalIntegration:
         ask_prompt = stream.ask.await_args.args[0]
         assert "rm -rf /tmp/foo" in ask_prompt
         assert "recursive delete" in ask_prompt
+
+
+# ---------------------------------------------------------------------------
+# Parallel subagent regression — entry_id prevents FIFO cross-routing
+# ---------------------------------------------------------------------------
+
+
+class TestParallelSubagentApprovalRouting:
+    """Two concurrent dangerous-command approvals in the SAME session
+    (what happens when ``delegate_tool`` runs parallel subagents) must
+    each resolve with their own user reply, not each other's. Pre-fix,
+    ``resolve_gateway_approval`` popped FIFO-oldest, so if reply B landed
+    before reply A, entry A got choice B and entry B got choice A.
+
+    Fix path: ``_ApprovalEntry.id`` + ``get_current_approval_entry_id``
+    contextvar + ``resolve_gateway_approval(entry_id=…)`` precise match.
+    The NATS notify bridge captures the id synchronously in notify_cb
+    and threads it through the scheduled coroutine's closure.
+    """
+
+    @pytest.mark.asyncio
+    async def test_out_of_order_replies_resolve_correct_entries(
+        self, monkeypatch
+    ):
+        # Two streams — one per "subagent" firing a dangerous command.
+        adapter = _build_adapter()
+        stream_a = _fake_stream(reply_text="once")    # subagent A reply
+        stream_b = _fake_stream(reply_text="always")  # subagent B reply
+        adapter._active_streams[("session-X", id(stream_a))] = stream_a
+        adapter._active_streams[("session-X", id(stream_b))] = stream_b
+
+        # Simulate two _ApprovalEntry's already in the queue (as
+        # ``check_all_command_guards`` would have populated them).
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, _current_approval_entry_id,
+        )
+        session_key = "agent:main:nats:dm:session-X"
+
+        # Clean any residue from prior tests sharing process state.
+        _gateway_queues.pop(session_key, None)
+
+        entry_a = _ApprovalEntry({"command": "rm -rf /tmp/a", "description": "delete A"})
+        entry_b = _ApprovalEntry({"command": "rm -rf /tmp/b", "description": "delete B"})
+        _gateway_queues[session_key] = [entry_a, entry_b]
+
+        loop = asyncio.get_running_loop()
+
+        # Dispatch for entry A — use A's contextvar, reference streamA.
+        # Contextvar is set → captured synchronously inside dispatch.
+        token_a = _current_approval_entry_id.set(entry_a.id)
+        try:
+            # Manually arrange the stream the adapter will resolve. Since
+            # _current_stream contextvar is what NatsAdapter.request_interaction
+            # prefers, wire it to stream_a explicitly.
+            import gateway.platforms.nats as nats_mod
+            ctx_token_a = nats_mod._current_stream.set(stream_a)
+            try:
+                scheduled_a = dispatch_approval_via_request_interaction(
+                    adapter, "session-X", session_key,
+                    entry_a.data, loop,
+                    timeout=5.0,
+                    entry_id=entry_a.id,
+                )
+            finally:
+                nats_mod._current_stream.reset(ctx_token_a)
+        finally:
+            _current_approval_entry_id.reset(token_a)
+        assert scheduled_a is True
+
+        # Dispatch for entry B — reference streamB.
+        token_b = _current_approval_entry_id.set(entry_b.id)
+        try:
+            import gateway.platforms.nats as nats_mod
+            ctx_token_b = nats_mod._current_stream.set(stream_b)
+            try:
+                scheduled_b = dispatch_approval_via_request_interaction(
+                    adapter, "session-X", session_key,
+                    entry_b.data, loop,
+                    timeout=5.0,
+                    entry_id=entry_b.id,
+                )
+            finally:
+                nats_mod._current_stream.reset(ctx_token_b)
+        finally:
+            _current_approval_entry_id.reset(token_b)
+        assert scheduled_b is True
+
+        # Yield so both scheduled coroutines run to completion. stream_a
+        # returns "once" → entry_a gets "once". stream_b returns "always"
+        # → entry_b gets "always". If FIFO were still in play, entry_a
+        # would have been resolved by whichever coroutine finished first.
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if entry_a.event.is_set() and entry_b.event.is_set():
+                break
+
+        assert entry_a.event.is_set(), "entry A never resolved"
+        assert entry_b.event.is_set(), "entry B never resolved"
+        assert entry_a.result == "once", (
+            f"entry A cross-routed — got {entry_a.result!r}, expected 'once'"
+        )
+        assert entry_b.result == "always", (
+            f"entry B cross-routed — got {entry_b.result!r}, expected 'always'"
+        )
+
+        # Each stream should have been asked exactly once, for its own query.
+        assert stream_a.ask.await_count == 1
+        assert stream_b.ask.await_count == 1
+
+        # Queue is drained.
+        assert session_key not in _gateway_queues
+
+    @pytest.mark.asyncio
+    async def test_entry_id_none_preserves_legacy_fifo_fallback(
+        self, monkeypatch
+    ):
+        # When entry_id is None (adapter that hasn't been updated, or
+        # a code path that genuinely can't capture an id), the dispatch
+        # helper still resolves SOMETHING — it passes entry_id=None to
+        # resolve_gateway_approval which falls back to FIFO. The test
+        # pins this so an over-eager refactor doesn't accidentally break
+        # the default gateway /approve path that all button-based
+        # adapters rely on.
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues,
+        )
+        adapter = _build_adapter()
+        stream = _fake_stream(reply_text="once")
+        adapter._active_streams[("legacy", id(stream))] = stream
+
+        session_key = "agent:main:nats:dm:legacy"
+        _gateway_queues.pop(session_key, None)
+        entry = _ApprovalEntry({"command": "x", "description": "y"})
+        _gateway_queues[session_key] = [entry]
+
+        loop = asyncio.get_running_loop()
+        scheduled = dispatch_approval_via_request_interaction(
+            adapter, "legacy", session_key,
+            entry.data, loop,
+            timeout=5.0,
+            # entry_id explicitly omitted — legacy path.
+        )
+        assert scheduled is True
+
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if entry.event.is_set():
+                break
+
+        # FIFO pop resolved this single pending entry.
+        assert entry.event.is_set()
+        assert entry.result == "once"
+        assert session_key not in _gateway_queues
 
 
 # ---------------------------------------------------------------------------

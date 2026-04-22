@@ -378,10 +378,21 @@ _permanent_approved: set = set()
 
 
 class _ApprovalEntry:
-    """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result")
+    """One pending dangerous-command approval inside a gateway session.
+
+    ``id`` is a process-unique tag (uuid4 hex) that adapter-side notify
+    bridges capture synchronously — via :func:`get_current_approval_entry_id`
+    during the ``notify_cb(approval_data)`` call — so the coroutine they
+    schedule later can :func:`resolve_gateway_approval` the *specific*
+    entry by id instead of popping FIFO-oldest. Eliminates the parallel-
+    subagent cross-routing where two concurrent dangerous commands in
+    one session resolve each other's choices.
+    """
+    __slots__ = ("id", "event", "data", "result")
 
     def __init__(self, data: dict):
+        import uuid  # lazy import — uuid is already loaded by many callers
+        self.id = uuid.uuid4().hex
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
@@ -389,6 +400,34 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+
+
+# Context-local handle to the approval entry currently being dispatched
+# through a ``notify_cb``. ``check_all_command_guards`` sets this around
+# the ``notify_cb(approval_data)`` call so the synchronous callback can
+# capture the entry id BEFORE scheduling async work (contextvars don't
+# propagate through ``asyncio.run_coroutine_threadsafe``, so the capture
+# must happen on the caller's thread before any loop hop).
+_current_approval_entry_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_current_approval_entry_id",
+    default=None,
+)
+
+
+def get_current_approval_entry_id() -> Optional[str]:
+    """Return the id of the approval entry currently being notified.
+
+    Defined only during the synchronous ``notify_cb(approval_data)``
+    invocation inside :func:`check_all_command_guards`. Adapter-side
+    notify bridges that schedule async work (``run_coroutine_threadsafe``)
+    should call this *before* the schedule hop and capture the result in
+    a closure — calling it from the scheduled coroutine returns ``None``
+    because the contextvar isn't propagated across threads / task
+    boundaries.
+
+    Returns ``None`` when called outside a notify dispatch.
+    """
+    return _current_approval_entry_id.get()
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -417,13 +456,25 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
+                             resolve_all: bool = False,
+                             entry_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
     When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    resolved at once (``/approve all``).  Otherwise:
+
+    * When *entry_id* is provided, resolve the SPECIFIC entry with that
+      id — the precise-match path used by adapter-side notify bridges
+      (NATS ``request_interaction``) that carry entry identity through
+      the schedule-and-reply round-trip. If no entry matches the id
+      (already resolved, cleared by unregister, …), returns 0.
+    * Otherwise resolve the FIFO-oldest entry — the legacy path used by
+      CLI ``/approve`` and button-based adapter flows (Slack, Discord,
+      Telegram, Feishu, Matrix) whose UIs don't plumb entry identity
+      through. Correct when only one approval is pending per session;
+      ambiguous for parallel-subagent scenarios, which is why the
+      entry_id path exists.
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
@@ -434,6 +485,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if resolve_all:
             targets = list(queue)
             queue.clear()
+        elif entry_id is not None:
+            # Precise match by id. No fallback to FIFO — if the caller
+            # supplied an id and it doesn't match, the entry is already
+            # gone (resolved, unregister-cleared) and we shouldn't
+            # spuriously resolve a DIFFERENT entry with this choice.
+            targets = [e for e in queue if getattr(e, "id", None) == entry_id]
+            for e in targets:
+                queue.remove(e)
         else:
             targets = [queue.pop(0)]
         if not queue:
@@ -1081,6 +1140,11 @@ def check_all_command_guards(command: str, env_type: str,
                 surface="gateway",
             )
 
+            # Bind the entry id on the current context so notify_cb can
+            # capture it synchronously via ``get_current_approval_entry_id``
+            # before scheduling async work. Reset in the try/finally so
+            # the contextvar doesn't leak past this call on this thread.
+            _entry_id_token = _current_approval_entry_id.set(entry.id)
             # Notify the user (bridges sync agent thread → async gateway)
             try:
                 notify_cb(approval_data)
@@ -1092,12 +1156,21 @@ def check_all_command_guards(command: str, env_type: str,
                         queue.remove(entry)
                     if not queue:
                         _gateway_queues.pop(session_key, None)
+                _current_approval_entry_id.reset(_entry_id_token)
                 return {
                     "approved": False,
                     "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
                 }
+
+            # notify_cb returned successfully — it has already captured
+            # the entry id synchronously (if it needed it) and scheduled
+            # any async work. The contextvar's job is done; reset it
+            # before the long ``entry.event.wait()`` so it doesn't leak
+            # into any unrelated synchronous work on this thread while
+            # we're blocked here.
+            _current_approval_entry_id.reset(_entry_id_token)
 
             # Block until the user responds or timeout (default 5 min).
             # Poll in short slices so we can fire activity heartbeats every

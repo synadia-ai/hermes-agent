@@ -156,6 +156,91 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_resolve_by_entry_id_targets_specific_entry(self):
+        """With entry_id, resolve the specific entry — not FIFO-oldest.
+
+        Guards the fix for parallel-subagent cross-routing: two pending
+        approvals in the same session must each resolve their own choice,
+        regardless of completion order.
+        """
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-by-id"
+        e1 = _ApprovalEntry({"command": "first"})
+        e2 = _ApprovalEntry({"command": "second"})
+        _gateway_queues[session_key] = [e1, e2]
+
+        # Resolve the NEWER entry (e2) first, by id. FIFO would have
+        # resolved e1 with this choice — the whole bug we're fixing.
+        count = resolve_gateway_approval(
+            session_key, "always", entry_id=e2.id,
+        )
+        assert count == 1
+        assert e2.event.is_set()
+        assert e2.result == "always"
+        # Older entry still pending — didn't get e2's choice routed to it.
+        assert not e1.event.is_set()
+        assert e1.result is None
+        assert _gateway_queues[session_key] == [e1]
+
+        # Now resolve e1 by id with its own choice.
+        count = resolve_gateway_approval(
+            session_key, "deny", entry_id=e1.id,
+        )
+        assert count == 1
+        assert e1.event.is_set()
+        assert e1.result == "deny"
+        assert session_key not in _gateway_queues
+
+    def test_resolve_by_unknown_entry_id_returns_zero_without_touching_queue(self):
+        """Unknown entry_id MUST NOT fall through to FIFO — that would
+        spuriously resolve an unrelated entry with this choice."""
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-unknown-id"
+        e1 = _ApprovalEntry({"command": "first"})
+        _gateway_queues[session_key] = [e1]
+
+        count = resolve_gateway_approval(
+            session_key, "always", entry_id="nonexistent",
+        )
+        assert count == 0
+        assert not e1.event.is_set()
+        assert e1.result is None
+        # Entry still in queue, untouched.
+        assert _gateway_queues[session_key] == [e1]
+
+    def test_current_entry_id_contextvar_roundtrip(self):
+        """``check_all_command_guards`` sets the contextvar around the
+        notify_cb call so adapter-side bridges can capture the id
+        synchronously before scheduling async work.
+        """
+        import tools.approval as approval_mod
+        from tools.approval import (
+            get_current_approval_entry_id,
+            _ApprovalEntry,
+            _current_approval_entry_id,
+        )
+
+        # Outside any notify dispatch → None.
+        assert get_current_approval_entry_id() is None
+
+        # Simulate what check_all_command_guards does: bind the id,
+        # invoke a callback, reset.
+        entry = _ApprovalEntry({"command": "x"})
+        token = _current_approval_entry_id.set(entry.id)
+        try:
+            assert get_current_approval_entry_id() == entry.id
+        finally:
+            _current_approval_entry_id.reset(token)
+
+        # After reset → None again.
+        assert get_current_approval_entry_id() is None
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (

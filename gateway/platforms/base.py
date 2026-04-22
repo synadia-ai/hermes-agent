@@ -530,6 +530,7 @@ def dispatch_approval_via_request_interaction(
     loop: "asyncio.AbstractEventLoop",
     *,
     timeout: float = 300.0,
+    entry_id: Optional[str] = None,
 ) -> bool:
     """Route a dangerous-command approval through ``adapter.request_interaction``.
 
@@ -540,6 +541,17 @@ def dispatch_approval_via_request_interaction(
     Returns ``False`` when the adapter inherits the base default — the
     caller should then fall back to the legacy flow (button-based
     ``send_exec_approval`` or plain-text ``/approve``).
+
+    ``entry_id`` is the process-unique tag of the ``_ApprovalEntry`` this
+    dispatch is resolving. Caller MUST capture it synchronously via
+    :func:`tools.approval.get_current_approval_entry_id` inside the notify
+    callback BEFORE invoking this helper — contextvars don't propagate
+    through ``asyncio.run_coroutine_threadsafe``, so the async ``_run``
+    coroutine can't read it later. When provided, the resolve is a
+    precise-match by id; when ``None``, falls back to FIFO-oldest pop
+    (legacy default). Pass None for the ``run.py:_approval_notify_sync``
+    path too when capture isn't feasible, and accept the FIFO risk only
+    for adapters that genuinely have no other option.
 
     The scheduled task swallows exceptions from ``request_interaction``
     itself (logged + treated as "deny") so a transport error can never
@@ -566,7 +578,7 @@ def dispatch_approval_via_request_interaction(
         choice = _parse_approval_reply(reply)
         try:
             from tools.approval import resolve_gateway_approval
-            resolve_gateway_approval(session_key, choice)
+            resolve_gateway_approval(session_key, choice, entry_id=entry_id)
         except Exception as exc:
             logger.error(
                 "Failed to resolve gateway approval for session %s: %s",
