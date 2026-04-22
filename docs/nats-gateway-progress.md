@@ -451,11 +451,27 @@ Ran an actual end-to-end round trip before closing Phase 7. Artifacts archived u
 - `nats-smoke-help-stdout.txt` — exact bytes received by the NATS client for `/help`.
 - `nats-smoke-status-stdout.txt` — same for `/status`.
 
-**Non-obvious setup friction encountered and resolved:**
+**Bootstrap requirements for a fresh checkout (and the shortcut to avoid):**
 
-- `./hermes` shebang picks up `/usr/bin/python3` (3.9 on macOS), which chokes on PEP 604 unions in `hermes_constants.py`. Use `venv/bin/python hermes …` explicitly. Running `uv run hermes` also works but creates a sibling `.venv` if the existing `venv/` isn't registered — either pre-register via `UV_PROJECT_ENVIRONMENT=venv` or just call the venv python directly.
-- The project `venv/` is uv-created and has no `pip` shim inside it. `source venv/bin/activate` → `pip` still points at miniconda globally (silent footgun — `pip install -e ../nats-ai-pysdk` landed in `/Users/rs/miniconda3/lib/python3.12/site-packages` instead of the venv). Use `uv pip install --python venv/bin/python -e ../nats-ai-pysdk` instead. Clean up any stray miniconda install with `/Users/rs/miniconda3/bin/pip uninstall -y natsagent nats-py`.
-- No API key is needed for the smoke — `/help` and `/status` don't hit the LLM path. The gateway starts cleanly even with the `WARNING No user allowlists configured` note (NATS has its own §10.1 auth path via the server-layer accounts, separate from the gateway allowlist — Phase 4 post-review).
+A fresh `git clone` of hermes-agent is **not** directly runnable — the README's contributor path (`./setup-hermes.sh`) must run first. That script installs `uv`, creates `venv/`, runs `uv sync --all-extras --locked` (or `uv pip install -e ".[all]"` as fallback), and symlinks `~/.local/bin/hermes`. Only after that does `./hermes` auto-detect the venv and all `.[all]` deps resolve.
+
+Two project-specific supplements on top of `./setup-hermes.sh`:
+
+1. **NATS SDK is local-path only** per the existing Decision log entry "Phase 1 — `natsagent` deliberately NOT added to the `all` extra" and the `pyproject.toml` comment on the `nats` extra. After the base bootstrap, also run:
+   ```bash
+   uv pip install --python venv/bin/python -e ../nats-ai-pysdk
+   ```
+   Without this, `natsagent` is missing and gateway startup aborts before the NATS adapter loads.
+
+2. **Nothing else.** No API key is needed for a `/help` or `/status` smoke — neither command hits the LLM path. The gateway starts cleanly even with the `WARNING No user allowlists configured` log line (§10.1 auth is at the NATS server-layer, not the gateway allowlist — Phase 4 post-review).
+
+If you find yourself doing any of the following, the checkout wasn't bootstrapped:
+
+- `./hermes --help` throws `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` → shebang landed on a pre-3.10 Python because the venv isn't the active one. Run `./setup-hermes.sh`.
+- `source venv/bin/activate && pip install …` lands packages in `/Users/<you>/miniconda3/...` → the venv was uv-created without a `pip` shim, and the shell's global `pip` wins activation. Use `uv pip install --python venv/bin/python …` instead. After `./setup-hermes.sh` this is moot.
+- `import natsagent` → `ModuleNotFoundError`. See supplement 1.
+
+Smoke-only shortcut (for an isolated, throwaway verification without a full bootstrap): `uv pip install --python venv/bin/python -e ../nats-ai-pysdk` and run `venv/bin/python hermes gateway run` directly. Sufficient for a single-session smoke; not a substitute for `./setup-hermes.sh` in any scenario where `./hermes` invocation matters.
 
 ### 2026-04-22 — Phase 7 — Pre-existing test failures unchanged
 
