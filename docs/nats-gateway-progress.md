@@ -421,6 +421,42 @@ The `/help` end-to-end test mirrors `gateway/run.py::_handle_help_command`'s rea
 
 `resolve_command` lowercases its argument before lookup, so `/HELP` and `/Help` would both resolve. `_looks_like_command` doesn't lowercase but also doesn't care about case — it just checks `isalnum()`. Net: mixed-case commands work end-to-end on NATS, though the design doc and prompt text use lowercase throughout. Not testing upper/mixed case explicitly to avoid over-constraining — if someone ever wants to gate on case, the constraint lives in the commands module, not the adapter.
 
+### 2026-04-22 — Phase 7 — Gap-closure review: real `_handle_help_command` + live smoke test
+
+User review of the initial Phase 7 landing surfaced two gaps in the automated tests:
+
+1. **Locally-reconstructed help body.** `test_help_body_is_utf8_safe_plain_text` and `test_dispatch_publishes_single_response_chunk` were building the expected help string inline (`"\n".join([header, *gateway_help_lines()])`) rather than calling the real `GatewayRunner._handle_help_command`. A future change that added ANSI escapes to the header literal, emitted non-UTF-8 bytes, or changed the structural wrapping would bypass both tests.
+
+2. **No live wire verification.** Design doc §14 says "confirm it still applies" but Phase 7 hadn't actually run the full stack against a nats-server; automated tests proved the adapter's behaviour on mocks only.
+
+Both gaps closed:
+
+- `_real_help_body()` helper added to `test_nats_commands.py` — instantiates `GatewayRunner` via `object.__new__` (same pattern as `tests/gateway/test_title_command.py::_make_runner`) and awaits `_handle_help_command(event)` directly. Two existing tests rewritten to await the helper. Keeps the file under the same no-runner-state constraint while exercising the real renderer end-to-end.
+- Live smoke test executed against a local `nats-server` — see immediately below.
+
+### 2026-04-22 — Phase 7 — Live NATS smoke test captured
+
+Ran an actual end-to-end round trip before closing Phase 7. Artifacts archived under `RENE/` (gitignored scratch) so we don't commit transient logs:
+
+**Flow:**
+1. `nats-server -p 4222 -a 127.0.0.1` in background.
+2. Isolated `HERMES_HOME=/tmp/hermes-nats-smoke` + env-only config (`NATS_URL`, `HERMES_NATS_OWNER=rene`, `HERMES_NATS_NAME=smoke`) → `venv/bin/python hermes gateway run -v`. Gateway registered as `agents.hermes.rene.smoke` (heartbeat=30s, max_payload=1MB).
+3. `examples/02-prompt-text.py --url nats://127.0.0.1:4222 "/help"` → stdout redirected to `/tmp/help-stdout.txt`. Same for `/status`.
+4. Byte-level validation: 5566 bytes, valid UTF-8, **zero** ANSI escapes (confirms the §10 "plain-text over NATS" invariant on the real wire), header + 38 command entries + skill-command section + "61 more" footer all present.
+5. `/status` also round-tripped cleanly (session ID, connected platforms list, etc. rendered as plain markdown).
+6. Teardown via `pkill` — both processes clean.
+
+**Archived artifacts** (in `RENE/`, not committed):
+- `nats-smoke-gateway.log` — gateway startup / connect log.
+- `nats-smoke-help-stdout.txt` — exact bytes received by the NATS client for `/help`.
+- `nats-smoke-status-stdout.txt` — same for `/status`.
+
+**Non-obvious setup friction encountered and resolved:**
+
+- `./hermes` shebang picks up `/usr/bin/python3` (3.9 on macOS), which chokes on PEP 604 unions in `hermes_constants.py`. Use `venv/bin/python hermes …` explicitly. Running `uv run hermes` also works but creates a sibling `.venv` if the existing `venv/` isn't registered — either pre-register via `UV_PROJECT_ENVIRONMENT=venv` or just call the venv python directly.
+- The project `venv/` is uv-created and has no `pip` shim inside it. `source venv/bin/activate` → `pip` still points at miniconda globally (silent footgun — `pip install -e ../nats-ai-pysdk` landed in `/Users/rs/miniconda3/lib/python3.12/site-packages` instead of the venv). Use `uv pip install --python venv/bin/python -e ../nats-ai-pysdk` instead. Clean up any stray miniconda install with `/Users/rs/miniconda3/bin/pip uninstall -y natsagent nats-py`.
+- No API key is needed for the smoke — `/help` and `/status` don't hit the LLM path. The gateway starts cleanly even with the `WARNING No user allowlists configured` note (NATS has its own §10.1 auth path via the server-layer accounts, separate from the gateway allowlist — Phase 4 post-review).
+
 ### 2026-04-22 — Phase 7 — Pre-existing test failures unchanged
 
 `scripts/run_tests.sh tests/gateway/test_nats_*.py` (all six NATS test files — 195 tests) passes cleanly. The pre-existing failures logged in earlier phases (`test_agent_cache.py`, `test_matrix.py`, `test_whatsapp_connect.py`, `test_approval_heartbeat.py`) live outside the NATS subtree and are unaffected.

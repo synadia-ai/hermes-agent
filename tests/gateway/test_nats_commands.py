@@ -143,19 +143,51 @@ class TestGatewayCommandsResolveBackToCommandDef:
 # ---------------------------------------------------------------------------
 
 
+async def _real_help_body() -> str:
+    """Call the real ``GatewayRunner._handle_help_command`` and return
+    its output string.
+
+    ``_handle_help_command`` only reads ``gateway_help_lines()`` and the
+    optional skill-command registry; it doesn't touch any runner state.
+    ``object.__new__`` bypasses ``__init__`` to avoid building a full
+    gateway just to render help text — same pattern used in
+    ``tests/gateway/test_title_command.py`` and friends.
+    """
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    runner = object.__new__(GatewayRunner)
+    event = MessageEvent(
+        text="/help",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.NATS,
+            user_id="alice",
+            chat_id="alice",
+            user_name="alice",
+            chat_type="dm",
+        ),
+    )
+    return await runner._handle_help_command(event)
+
+
 class TestHelpRenderedAsPlainTextChunk:
     """``/help`` must produce one plain-text ``ResponseChunk`` — no
     attachments, no buttons, just readable text on stdout if dumped via
     ``nats sub``.
+
+    All assertions exercise the **real** ``_handle_help_command`` output
+    (via ``_real_help_body``) rather than a locally-reconstructed copy.
+    If the handler ever injects ANSI escapes, adds unexpected structural
+    wrapping, or emits non-UTF-8 bytes, these tests surface it before it
+    reaches NATS callers.
     """
 
     @pytest.mark.asyncio
     async def test_dispatch_publishes_single_response_chunk(self) -> None:
         adapter = _build_adapter()
-
-        # Mirror the real ``_handle_help_command``: prepend a header,
-        # then join the actual ``gateway_help_lines()`` output.
-        help_body = "\n".join(["📖 **Hermes Commands**\n", *gateway_help_lines()])
+        help_body = await _real_help_body()
         adapter._message_handler = AsyncMock(return_value=help_body)
 
         stream = MagicMock()
@@ -190,10 +222,17 @@ class TestHelpRenderedAsPlainTextChunk:
     @pytest.mark.asyncio
     async def test_help_body_is_utf8_safe_plain_text(self) -> None:
         # Emoji header and arrows should round-trip through the UTF-8
-        # wire cleanly. Pin the encoding invariant — any future change
-        # that injects e.g. terminal escape sequences would surface here.
-        help_body = "\n".join(["📖 **Hermes Commands**\n", *gateway_help_lines()])
+        # wire cleanly. Pin the encoding invariant on the **real**
+        # handler output — any future change that injects e.g. terminal
+        # escape sequences (from a misguided Rich/colorama call inside
+        # ``_handle_help_command``) surfaces here before hitting NATS.
+        help_body = await _real_help_body()
         encoded = help_body.encode("utf-8")
         assert encoded.decode("utf-8") == help_body
         # No ANSI escape sequences — NATS callers won't be on a TTY.
         assert "\x1b[" not in help_body
+        # ``gateway_help_lines()`` must have contributed — sanity on the
+        # real path being exercised (not a mysteriously empty string).
+        assert "/help" in help_body
+        # Used as a direct ResponseChunk payload — must not be empty.
+        assert help_body.strip()
