@@ -8,7 +8,7 @@ over the reply subject; the SDK owns terminator + heartbeat emission.
 Protocol spec: ``../nats-ai-pysdk/docs/nats-agent-protocol.md`` (v0.1).
 Hermes architectural reference: ``docs/nats-gateway-design.md``.
 
-Phase 4 scope (T4.1–T4.3): full inbound pipeline — x-session extraction,
+Phase 4 scope (T4.1–T4.3): full inbound pipeline — session extraction,
 attachment decoding, MessageEvent construction, keep-alive emission,
 adapter-owned AIAgent + streaming delta pump for text prompts, and
 reuse of the gateway's command dispatch for slash commands.
@@ -88,7 +88,7 @@ _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
 # Handler-scoped current stream. Set by ``_on_prompt`` at entry and reset
 # in its ``finally`` block; read by ``send()`` and the ``send_*`` helpers
 # to reach the caller's own reply subject even when two prompts for the
-# same ``x-session`` overlap.
+# same ``envelope.session`` overlap.
 #
 # T5.0 (Phase 5) — this is the race-safe primary lookup. ``_active_streams``
 # is kept as a compound-keyed ``(chat_id, id(stream)) → stream`` dict for
@@ -358,7 +358,7 @@ class NatsAdapter(BasePlatformAdapter):
     """Gateway adapter for the NATS Agent Protocol v0.1.
 
     Phase 4 scope — settings parsing, connect/disconnect lifecycle, and
-    the full inbound pipeline: ``_on_prompt`` extracts ``x-session``,
+    the full inbound pipeline: ``_on_prompt`` reads ``envelope.session``,
     decodes attachments, starts a keep-alive task, dispatches slash
     commands through the gateway's command registry, and drives text
     prompts through an adapter-owned ``AIAgent`` with streaming deltas
@@ -379,7 +379,7 @@ class NatsAdapter(BasePlatformAdapter):
         # Compound-keyed handle registry: ``(chat_id, id(stream)) → stream``.
         # Populated by ``_on_prompt`` on receipt and consulted by
         # ``send()`` / ``send_*`` helpers. Two prompts arriving with the
-        # same ``x-session`` therefore each land on a distinct key rather
+        # same ``envelope.session`` therefore each land on a distinct key rather
         # than overwriting each other (Phase 4 shortcoming #1 / T5.0).
         # The primary per-handler lookup is the ``_current_stream``
         # contextvar; this dict covers only the rare "send scheduled
@@ -400,7 +400,7 @@ class NatsAdapter(BasePlatformAdapter):
         self._shutdown_event: asyncio.Event = asyncio.Event()
         self._in_flight_handlers: Set[asyncio.Task] = set()
 
-        # Per-``x-session`` serialization. Concurrent ``_on_prompt``
+        # Per-``envelope.session`` serialization. Concurrent ``_on_prompt``
         # invocations for the same chat_id queue on this lock so only one
         # handler is active per session at a time. Prevents the
         # stacking-race documented in the Phase 6 shortcomings:
@@ -414,7 +414,7 @@ class NatsAdapter(BasePlatformAdapter):
         #     ``(chat_id, *)`` entries exist.
         # Both concerns vanish when only one handler per chat_id runs at
         # a time. Distinct chat_ids still run in parallel. The lock dict
-        # grows with every distinct x-session seen; ``_teardown_handles``
+        # grows with every distinct session seen; ``_teardown_handles``
         # clears it on disconnect so adapter restarts reset the pool.
         self._session_locks: Dict[str, asyncio.Lock] = {}
 
@@ -635,8 +635,8 @@ class NatsAdapter(BasePlatformAdapter):
 
         Sequence (design doc §6.2):
 
-          1. Extract ``x-session`` → ``chat_id`` (raw envelope bytes
-             because the SDK's pydantic model drops unknown fields).
+          1. Read ``envelope.session`` → ``chat_id`` (spec §5.1 optional
+             field; falls back to ``session_default`` when unset).
           2. Decode any ``attachments`` into the hermes media cache so the
              downstream agent can read them via local paths (§8.1). Done
              *before* the session lock so attachment errors fail fast
@@ -662,7 +662,7 @@ class NatsAdapter(BasePlatformAdapter):
         if task is not None:
             self._in_flight_handlers.add(task)
 
-        chat_id = self._extract_session(stream) or self._session_default()
+        chat_id = (envelope.session or "").strip() or self._session_default()
         keepalive_task: Optional[asyncio.Task] = None
         stream_key: Optional[Tuple[str, int]] = None
 
@@ -697,7 +697,7 @@ class NatsAdapter(BasePlatformAdapter):
             session_lock = self._session_locks.setdefault(chat_id, asyncio.Lock())
             async with session_lock:
                 # Register under a compound key so overlapping prompts
-                # with the same ``x-session`` still don't collide in the
+                # with the same ``envelope.session`` still don't collide in the
                 # registry — belt-and-braces defense since the lock
                 # should prevent overlap in the first place.
                 stream_key = (chat_id, id(stream))
@@ -766,7 +766,8 @@ class NatsAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _session_default(self) -> str:
-        """Return the fallback ``x-session`` value from settings.
+        """Return the fallback session value from settings when the caller
+        omits ``envelope.session``.
 
         Isolated as a method so the test-only path where ``_settings`` is
         None (fatal-init adapter) still has a deterministic answer rather
@@ -775,21 +776,6 @@ class NatsAdapter(BasePlatformAdapter):
         if self._settings is not None:
             return self._settings.session_default
         return DEFAULT_SESSION_DEFAULT
-
-    def _extract_session(self, stream: Any) -> Optional[str]:
-        """Peek raw request bytes for ``x-session`` (§5.6 unknown-field passthrough).
-
-        The SDK's :class:`Envelope` uses ``extra="ignore"``, so parsed
-        envelopes drop ``x-session``. We re-parse the raw payload via
-        ``stream._request.data`` — private but stable, and this is the
-        adapter-local workaround approved in design doc §3 pending an
-        SDK upstream.
-        """
-        request = getattr(stream, "_request", None)
-        raw = getattr(request, "data", None)
-        if not isinstance(raw, (bytes, bytearray)):
-            return None
-        return _extract_x_session(bytes(raw))
 
     # ------------------------------------------------------------------
     # Attachment round-trip — §8.1
@@ -1290,7 +1276,7 @@ class NatsAdapter(BasePlatformAdapter):
         )
 
         # Load prior history so multi-turn conversations over the same
-        # x-session stay coherent.
+        # session stay coherent.
         conversation_history: List[Dict[str, Any]] = []
         if session_db is not None:
             try:
@@ -1385,7 +1371,7 @@ class NatsAdapter(BasePlatformAdapter):
              inherited by every coroutine / executor thread spawned from
              that handler (``run_in_executor`` and ``asyncio.Task``
              default-copy the parent's context). This is the race-safe
-             path: two concurrent prompts for the same ``x-session`` each
+             path: two concurrent prompts for the same ``envelope.session`` each
              see their own handler's stream here regardless of which
              overwrote the other in ``_active_streams``.
           2. ``_active_streams`` compound-key lookup by ``chat_id`` — the
@@ -1681,7 +1667,7 @@ class NatsAdapter(BasePlatformAdapter):
         The NATS wire has no richer chat concept — every prompt is a
         direct request/reply, so ``chat_type="dm"`` is always the right
         answer (design doc §3). The name mirrors the caller-supplied
-        ``x-session`` string, which is what ``build_session_key`` uses
+        ``envelope.session`` string, which is what ``build_session_key`` uses
         downstream to key sessions.
         """
         return {"name": chat_id, "type": "dm"}
@@ -1718,45 +1704,6 @@ def _approval_timeout_from_config() -> float:
         return float(int(timeout))
     except Exception:
         return 300.0
-
-
-def _extract_x_session(raw: bytes) -> Optional[str]:
-    """Pull the ``x-session`` field from a raw envelope payload.
-
-    Returns None when:
-      - The payload is the plain-text §5.3 shorthand (not a JSON object).
-      - The JSON is malformed or not an object.
-      - ``x-session`` is missing, non-string, or empty after strip.
-
-    The SDK's :class:`Envelope` drops the field via ``extra="ignore"``
-    (envelope.py:35), so this local re-parse is the sanctioned workaround
-    per design doc §3 pending an SDK upstream.
-    """
-    if not raw:
-        return None
-    # §5.3 discrimination rule: first non-whitespace byte must be '{' for
-    # the JSON branch. Short-circuit the plain-text shorthand here so we
-    # don't even try a full ``json.loads`` on arbitrary UTF-8 text.
-    _ASCII_WS = b" \t\n\r"
-    for b in raw:
-        if b in _ASCII_WS:
-            continue
-        if b != ord("{"):
-            return None
-        break
-    else:
-        return None
-    try:
-        obj = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    value = obj.get("x-session")
-    if not isinstance(value, str):
-        return None
-    stripped = value.strip()
-    return stripped or None
 
 
 def _final_response_text(result: Any) -> str:

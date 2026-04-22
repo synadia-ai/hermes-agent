@@ -500,7 +500,7 @@ class TestDisconnect:
         self, mock_natsagent, lock_granted
     ):
         # The per-chat_id session-lock pool accumulates one entry per
-        # distinct x-session seen. ``disconnect()`` must reset it so a
+        # distinct session seen. ``disconnect()`` must reset it so a
         # subsequent ``connect()`` doesn't inherit Locks from the prior
         # session — Locks held by cancelled tasks wouldn't release
         # cleanly and could deadlock a retry.

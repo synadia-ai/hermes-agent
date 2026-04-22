@@ -2,9 +2,6 @@
 
 Covers, in order of the prompt lifecycle (design doc §6.2):
 
-* ``_extract_x_session`` — JSON branch returns the caller's session, the
-  plain-text shorthand shortcut returns None, malformed inputs fall back
-  gracefully, and empty / non-string values are rejected.
 * ``_unpack_envelope`` — extension routing (image/audio/video/document),
   base64 decode failures surface as ``RuntimeError`` (→ SDK 400), and
   ``media_urls`` / ``media_types`` are aligned with the first entry
@@ -40,7 +37,6 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.nats import (
     NatsAdapter,
-    _extract_x_session,
     _final_response_text,
 )
 
@@ -68,8 +64,10 @@ def _build_adapter(**extra_overrides) -> NatsAdapter:
 def _fake_stream(raw: bytes = b"") -> MagicMock:
     """Build a PromptStream-shaped MagicMock.
 
-    ``_extract_session`` reads ``stream._request.data`` — wire that up so
-    the adapter can peek the raw envelope for the ``x-session`` hack.
+    ``raw`` is retained for callers that still want to pin the
+    `stream._request.data` attribute (some tests assert against it), but
+    the adapter itself no longer reads it — session now comes off the
+    parsed ``Envelope``.
     """
     stream = MagicMock()
     stream.send = AsyncMock()
@@ -77,6 +75,20 @@ def _fake_stream(raw: bytes = b"") -> MagicMock:
     request.data = raw
     stream._request = request
     return stream
+
+
+def _envelope(prompt: str, *, session: Optional[str] = None, attachments=None) -> MagicMock:
+    """Build a minimal Envelope-shaped MagicMock for ``_on_prompt`` tests.
+
+    Explicitly pins ``session`` and ``attachments`` so MagicMock's
+    auto-child-attribute behavior doesn't leak truthy junk into the
+    adapter's ``envelope.session or default`` dispatch.
+    """
+    env = MagicMock()
+    env.prompt = prompt
+    env.session = session
+    env.attachments = attachments
+    return env
 
 
 @pytest.fixture(autouse=True)
@@ -88,54 +100,6 @@ def _fresh_natsagent_mock(monkeypatch):
     own send side-effects so no per-test re-planting is needed.
     """
     return sys.modules["natsagent"]
-
-
-# ---------------------------------------------------------------------------
-# _extract_x_session
-# ---------------------------------------------------------------------------
-
-
-class TestExtractXSession:
-    def test_returns_session_from_json_envelope(self):
-        raw = b'{"prompt":"hi","x-session":"alice"}'
-        assert _extract_x_session(raw) == "alice"
-
-    def test_tolerates_leading_whitespace(self):
-        # Protocol §5.3: first non-whitespace byte must be '{' for JSON.
-        raw = b'   \n{"prompt":"hi","x-session":"alice"}'
-        assert _extract_x_session(raw) == "alice"
-
-    def test_plain_text_shorthand_returns_none(self):
-        # Plain UTF-8 is the §5.3 shorthand ``{"prompt": <text>}`` —
-        # there's no x-session field to extract.
-        assert _extract_x_session(b"tell me a joke") is None
-
-    def test_malformed_json_returns_none(self):
-        assert _extract_x_session(b"{not json") is None
-
-    def test_empty_payload_returns_none(self):
-        assert _extract_x_session(b"") is None
-
-    def test_whitespace_only_payload_returns_none(self):
-        assert _extract_x_session(b"   \t\n") is None
-
-    def test_non_object_json_returns_none(self):
-        # ``[]`` is valid JSON but not an envelope.
-        assert _extract_x_session(b"[]") is None
-
-    def test_missing_field_returns_none(self):
-        assert _extract_x_session(b'{"prompt":"hi"}') is None
-
-    def test_non_string_field_returns_none(self):
-        assert _extract_x_session(b'{"prompt":"hi","x-session":42}') is None
-
-    def test_empty_string_returns_none(self):
-        # An empty session is indistinguishable from "missing" for
-        # routing purposes — fall back to the settings default.
-        assert _extract_x_session(b'{"prompt":"hi","x-session":""}') is None
-
-    def test_whitespace_only_session_returns_none(self):
-        assert _extract_x_session(b'{"prompt":"hi","x-session":"   "}') is None
 
 
 # ---------------------------------------------------------------------------
@@ -767,10 +731,8 @@ class TestOnPromptIntegration:
     @pytest.mark.asyncio
     async def test_text_prompt_dispatches_to_text_path(self, monkeypatch):
         adapter = _build_adapter()
-        envelope = MagicMock()
-        envelope.prompt = "hello agent"
-        envelope.attachments = None
-        stream = _fake_stream(b'{"prompt":"hello agent","x-session":"alice"}')
+        envelope = _envelope("hello agent", session="alice")
+        stream = _fake_stream()
 
         text_prompt_calls: list = []
 
@@ -794,10 +756,8 @@ class TestOnPromptIntegration:
     @pytest.mark.asyncio
     async def test_slash_command_dispatches_to_command_path(self, monkeypatch):
         adapter = _build_adapter()
-        envelope = MagicMock()
-        envelope.prompt = "/help"
-        envelope.attachments = None
-        stream = _fake_stream(b'{"prompt":"/help"}')
+        envelope = _envelope("/help")
+        stream = _fake_stream()
 
         dispatched: list = []
 
@@ -825,10 +785,8 @@ class TestOnPromptIntegration:
         # command registry misses the dispatch and the caller sees the
         # text prompt path instead of the command response.
         adapter = _build_adapter()
-        envelope = MagicMock()
-        envelope.prompt = "  /help"
-        envelope.attachments = None
-        stream = _fake_stream(b'{"prompt":"  /help"}')
+        envelope = _envelope("  /help")
+        stream = _fake_stream()
 
         dispatched: list = []
 
@@ -853,10 +811,8 @@ class TestOnPromptIntegration:
     @pytest.mark.asyncio
     async def test_registers_stream_and_cleans_up_on_success(self, monkeypatch):
         adapter = _build_adapter()
-        envelope = MagicMock()
-        envelope.prompt = "hi"
-        envelope.attachments = None
-        stream = _fake_stream(b'{"prompt":"hi","x-session":"bob"}')
+        envelope = _envelope("hi", session="bob")
+        stream = _fake_stream()
 
         observed: dict = {}
 
@@ -870,7 +826,7 @@ class TestOnPromptIntegration:
         await adapter._on_prompt(envelope, stream)
 
         # T5.0 — the registry is compound-keyed (chat_id, id(stream)) so
-        # overlapping x-session prompts can coexist. The contextvar is the
+        # overlapping session prompts can coexist. The contextvar is the
         # race-safe primary lookup; this dict is the diagnostic fallback.
         assert observed["active_streams_during_run"] == {("bob", id(stream)): stream}
         # After the handler returns, the stream must be gone so a later
@@ -880,15 +836,13 @@ class TestOnPromptIntegration:
         assert adapter._in_flight_handlers == set()
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_default_session_when_x_session_missing(
+    async def test_falls_back_to_default_session_when_session_missing(
         self, monkeypatch
     ):
         adapter = _build_adapter(session_default="fallback")
-        envelope = MagicMock()
-        envelope.prompt = "hi"
-        envelope.attachments = None
-        # Plain-text shorthand carries no x-session → fallback.
-        stream = _fake_stream(b"hi")
+        # Envelope with no session → adapter falls back to session_default.
+        envelope = _envelope("hi")
+        stream = _fake_stream()
 
         captured: list = []
 
@@ -903,10 +857,8 @@ class TestOnPromptIntegration:
     @pytest.mark.asyncio
     async def test_cleans_up_when_run_text_prompt_raises(self, monkeypatch):
         adapter = _build_adapter()
-        envelope = MagicMock()
-        envelope.prompt = "hi"
-        envelope.attachments = None
-        stream = _fake_stream(b'{"prompt":"hi","x-session":"carol"}')
+        envelope = _envelope("hi", session="carol")
+        stream = _fake_stream()
 
         async def _boom(event, s, chat_id):
             raise RuntimeError("agent exploded")
@@ -925,10 +877,8 @@ class TestOnPromptIntegration:
     @pytest.mark.asyncio
     async def test_current_task_is_tracked_during_handler(self, monkeypatch):
         adapter = _build_adapter()
-        envelope = MagicMock()
-        envelope.prompt = "hi"
-        envelope.attachments = None
-        stream = _fake_stream(b'{"prompt":"hi"}')
+        envelope = _envelope("hi")
+        stream = _fake_stream()
 
         tracked: list = []
 
@@ -951,10 +901,8 @@ class TestOnPromptIntegration:
         # terminator fires — spec violation. Verify it's cancelled in
         # the finally block of _on_prompt.
         adapter = _build_adapter(ack_keepalive_interval_s=1)
-        envelope = MagicMock()
-        envelope.prompt = "hi"
-        envelope.attachments = None
-        stream = _fake_stream(b'{"prompt":"hi"}')
+        envelope = _envelope("hi")
+        stream = _fake_stream()
 
         captured_tasks: list = []
 

@@ -651,6 +651,18 @@ Deliberately did NOT update the README's platform lists (lines 20 / 58 / 69 / 96
 
 Phase 9 is docs-only — no code changes. Full NATS test subtree re-run (203/203 green in ~3 s) confirms the code surface wasn't accidentally touched during the doc pass. Ready for PR on the `nats-gateway` branch.
 
+### 2026-04-22 — Post-Phase 9 — SDK session support landed; `_extract_session` workaround removed
+
+The `natsagent` SDK grew a first-class `Envelope.session: str | None` field (caller-side: `remote.prompt(text, session="…")`; examples: `--session NAME` on 02/03/04). The adapter no longer needs to peek `stream._request.data`:
+
+- `gateway/platforms/nats.py:665` now reads `envelope.session` directly.
+- `_extract_session` (method) and `_extract_x_session` (module helper) deleted — ~50 lines of dead code gone.
+- `TestExtractXSession` (11 unit tests) deleted; `_on_prompt` tests updated to pin `envelope.session` explicitly on MagicMock envelopes.
+- Design doc §3 ("Session model") rewritten; §17.9 retrospective marked resolved.
+- Symmetric doc updates in `website/docs/user-guide/messaging/nats.md`, `website/docs/reference/environment-variables.md`, `gateway/platforms/ADDING_A_PLATFORM.md`, `gateway/run.py`.
+
+Earlier phase logs above still reference `x-session` and the raw-bytes workaround — that's historical record of what shipped in Phases 4–8, deliberately preserved, not stale documentation to be updated.
+
 ## Task definitions reference
 
 If `TaskList` is empty after a context clear and you need to recreate the tasks, use these verbatim. Subject / description / activeForm are the `TaskCreate` parameters.

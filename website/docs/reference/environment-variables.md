@@ -384,7 +384,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `HERMES_NATS_AGENT` | NATS agent family token in the subject `agents.<agent>.<owner>.<name>` (default: `hermes`) |
 | `HERMES_NATS_OWNER` | NATS owner token (required when NATS is enabled) |
 | `HERMES_NATS_NAME` | NATS instance name token (required when NATS is enabled) |
-| `HERMES_NATS_SESSION` | Default `x-session` fallback when callers don't specify one (default: `default`) |
+| `HERMES_NATS_SESSION` | Default `envelope.session` fallback when callers don't specify one (default: `default`) |
 | `WEBHOOK_ENABLED` | Enable the webhook platform adapter (`true`/`false`) |
 | `WEBHOOK_PORT` | HTTP server port for receiving webhooks (default: `8644`) |
 | `WEBHOOK_SECRET` | Global HMAC secret for webhook signature validation (used as fallback when routes don't specify their own) |

@@ -103,11 +103,11 @@ def test_whatsapp_lid_user_matches_phone_allowlist_via_session_mapping(monkeypat
 def test_nats_is_authorized_without_user_allowlist(monkeypatch):
     """NATS authenticates at the server/account layer (NKey / JWT / TLS)
     — design doc §10.1. The gateway's user allowlist doesn't apply to the
-    ``x-session`` value we use as user_id, so ``_is_user_authorized`` must
-    return True unconditionally for Platform.NATS, the same way it does
+    envelope ``session`` value we use as user_id, so ``_is_user_authorized``
+    must return True unconditionally for Platform.NATS, the same way it does
     for HomeAssistant (HASS_TOKEN) and Webhook (HMAC). Without this, every
     ``/help`` over NATS replies with a pairing code instead of the help
-    text because the caller's x-session string isn't in any allowlist.
+    text because the caller's session string isn't in any allowlist.
     """
     _clear_auth_env(monkeypatch)
 

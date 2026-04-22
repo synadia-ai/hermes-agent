@@ -13,7 +13,7 @@ Cross-references to the protocol spec are by section number (e.g. §5.6). Cross-
 
 Add `gateway/platforms/nats.py` as a new `BasePlatformAdapter` subclass. It registers one `natsagent.Agent` with the identity `agents.hermes.<owner>.<name>` at gateway startup; each inbound `prompt` is translated into a Hermes `MessageEvent`, routed through the normal gateway handler, streamed back chunk-by-chunk over NATS, and terminated by the SDK's empty-body terminator.
 
-Session routing uses a caller-supplied envelope field `x-session` (§5.6 unknown-field passthrough). Mid-stream approvals round-trip via `PromptStream.ask()`. Attachments round-trip base64 ↔ Hermes media cache. The adapter owns its own `AIAgent` construction and streaming pipeline (api_server-style), bypassing the gateway's `GatewayStreamConsumer` — see §6 for why.
+Session routing uses the caller-supplied envelope field `session` (protocol §5.1, optional string). Mid-stream approvals round-trip via `PromptStream.ask()`. Attachments round-trip base64 ↔ Hermes media cache. The adapter owns its own `AIAgent` construction and streaming pipeline (api_server-style), bypassing the gateway's `GatewayStreamConsumer` — see §6 for why.
 
 Explicit non-goals: the future `attachments` endpoint (§5.5), JetStream at-least-once, E2E encryption, cross-platform adapter-level approval refactor. All are carried forward in §13.
 
@@ -25,7 +25,7 @@ Explicit non-goals: the future `attachments` endpoint (§5.5), JetStream at-leas
 |-----------|-------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
 | Inbound   | `Envelope.prompt`                                                 | `MessageEvent.text`                                                                                  |
 | Inbound   | `Envelope.attachments[i]` (base64)                                 | Decoded via `att.to_bytes()`, routed through `cache_{image,audio,document,video}_from_bytes` → `MessageEvent.media_urls` / `media_types` |
-| Inbound   | `x-session` (§5.6 additional top-level field)                      | `SessionSource.chat_id` — opaque session string, default `"default"`                                 |
+| Inbound   | `Envelope.session` (§5.1 optional field)                           | `SessionSource.chat_id` — opaque session string, default `"default"`                                 |
 | Inbound   | `agents.hermes.<owner>.<name>` subject (prompt endpoint)           | Implicit — SDK dispatches to `Agent.on_prompt()`                                                     |
 | Outbound  | `{type: response, data: "<text>"}` (§6.3 bare-string form)         | `stream.send(ResponseChunk(text=delta))` via adapter-local `stream_delta_callback`                   |
 | Outbound  | `{type: response, data: {text, attachments: [...]}}`               | `send_image_file()` / `send_document()` / `send_voice()` / `send_video()` → `ResponseChunk(text=caption, attachments=[Attachment.from_path(...)])` |
@@ -46,21 +46,21 @@ Explicit non-goals: the future `attachments` endpoint (§5.5), JetStream at-leas
 
 ## 3. Session model
 
-**Design decision:** caller-supplied `x-session` envelope field, default `"default"`.
+**Design decision:** caller-supplied `session` envelope field, default `"default"`.
 
 ### Why a caller-supplied field
 
-- Protocol §5.6 explicitly allows additional top-level envelope fields and requires decoders to tolerate and preserve them.
+- Protocol §5.1 makes `session` an optional top-level envelope field. The `natsagent` SDK models it as `Envelope.session: str | None`.
 - The protocol's `metadata.session` (§3.2) identifies the *agent instance*, not the *conversation*. Using a single agent instance with per-caller session scoping is cheaper than spawning one NATS registration per Hermes session (§3.3 allows it but it's heavyweight).
 - Keeps the NATS wire shape compatible with `nats pub` plain-text testing (default falls through when no envelope field is set).
 
 ### Inbound translation
 
 ```text
-envelope.x-session  (string or missing)
+envelope.session  (string or None)
      │
      ▼
-chat_id = envelope_dict.get("x-session") or "default"
+chat_id = (envelope.session or "").strip() or session_default
      │
      ▼
 SessionSource(
@@ -78,33 +78,16 @@ build_session_key(source, group_sessions_per_user=True)
 
 This lands in exactly the same shape the rest of the gateway already handles — `handle_message()` on the base class does its usual routing, pending-message draining, and session bookkeeping without special-casing NATS.
 
-### Parsing `x-session`
+### Reading `session`
 
-The `natsagent` SDK's `Envelope` pydantic model uses `extra="ignore"` (`envelope.py:35`), so parsed envelopes drop unknown fields. We do NOT re-parse the raw bytes; instead we peek the raw JSON dict in the adapter before letting the SDK decode. Concretely:
+The SDK exposes `session` as a first-class field on the parsed `Envelope`, so the adapter reads it directly:
 
 ```python
-# gateway/platforms/nats.py (shape, not final code)
-async def _on_prompt(self, envelope: Envelope, stream: PromptStream, *, raw: bytes) -> None:
-    session = _extract_session(raw) or self._settings.session_default
-    ...
-
-def _extract_session(raw: bytes) -> str | None:
-    if not raw.startswith(b"{"):
-        return None   # plain-text shorthand → no x-session possible
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    sess = obj.get("x-session")
-    return sess if isinstance(sess, str) and sess else None
+# gateway/platforms/nats.py::_on_prompt
+chat_id = (envelope.session or "").strip() or self._session_default()
 ```
 
-**Open question for reviewer:** the SDK's `PromptHandler` signature is `(Envelope, PromptStream)` — `raw` is not currently passed. Two resolutions:
-
-- **(a)** Ask the SDK to surface the raw bytes on `Envelope` (or thread them to the handler). Cleanest but cross-repo.
-- **(b)** Extend `Envelope` via a fork / monkeypatch in the adapter (re-parse the payload ourselves). Keeps the change local.
-
-**Recommendation:** (b) for MVP, with a note to upstream (a) to `nats-ai-pysdk` as follow-up. The pattern is already permitted by §5.6 ("MUST preserve such fields when relaying"), so the SDK can legitimately add a raw/extras handle.
+No raw-bytes re-parse, no private attribute access. Earlier drafts of this doc and pre-0.1.1 SDK versions required the adapter to peek `stream._request.data` because the SDK's pydantic model dropped unknown fields via `extra="ignore"`; that workaround shipped in Phases 4–8 and was removed once the SDK landed first-class session support.
 
 ### Interaction with `group_sessions_per_user`
 
@@ -131,7 +114,7 @@ platforms:
       name: gateway                       # §2 token; required
 
       # Behavior tuning (all optional)
-      session_default: "default"          # x-session fallback
+      session_default: "default"          # envelope.session fallback
       heartbeat_interval_s: 30            # §8.2 default
       max_payload: "1MB"                  # §2.1 endpoint metadata
       attachments_ok: true                # §2.1 endpoint metadata
@@ -210,7 +193,7 @@ NATS msg on agents.hermes.<owner>.<name>
          ▼
  SDK decodes envelope → calls adapter._on_prompt(envelope, stream)
          │
-         ├─── extract x-session → chat_id
+         ├─── read envelope.session → chat_id
          ├─── decode attachments → cache_* → media_urls/media_types
          ├─── build MessageEvent
          │
@@ -265,7 +248,7 @@ Specific cases handled explicitly:
 
 | Failure                          | Handling                                                                    |
 |----------------------------------|-----------------------------------------------------------------------------|
-| `x-session` not a string         | Warn and fall back to `"default"` — §5.6 says tolerate unknown fields       |
+| `envelope.session` is empty/blank | Fall back to `session_default` — matches spec §5.1 "optional" semantics     |
 | Attachment base64 invalid        | Raise `ProtocolError` → SDK responds 400                                    |
 | `attachments_ok=false` + atts    | Raise — SDK responds 400 per §5.4                                           |
 | Envelope > `max_payload`         | SDK caller-side enforcement (§5.4). Agent-side enforcement deferred (§13)   |
@@ -428,7 +411,7 @@ Agent._on_prompt_request → decode envelope → PromptStream → handler
         ▼
 NatsAdapter._on_prompt(envelope, stream)
         │
-        ├── chat_id = extract_x_session(raw) or settings.session_default
+        ├── chat_id = envelope.session or settings.session_default
         ├── media = decode_attachments(envelope.attachments)
         ├── event  = MessageEvent(text=envelope.prompt, source=..., media_urls=..., ...)
         │
@@ -489,7 +472,7 @@ Output of commands lands in `stream.send(ResponseChunk(text=...))` the same way 
 | Caller drops reply subscription (§6.7)    | No detection in MVP                        | Agent runs to completion; published chunks dropped by NATS server        |
 | Oversize inbound envelope                 | `natsagent`'s caller-side §5.4 + our check | Reject before cache_*; raise → SDK `respond_error(400)`                  |
 | Handler raises unexpectedly               | SDK wraps exception                        | `respond_error(500, <sanitized desc>)` then terminator                   |
-| x-session is non-string                   | `_extract_session` type check              | Warn; fall back to `session_default`                                     |
+| `envelope.session` empty/blank/None       | SDK's pydantic field (`str | None`)        | Fall back to `session_default`                                           |
 | `max_payload` format bad at init          | `natsagent._bytes.parse_human_bytes` raise | `_set_fatal_error(...)` during `__init__`                                |
 | `owner`/`name` violate §2.2               | `AgentSubject.new()` raise                  | `_set_fatal_error(...)` during `connect()`                               |
 | Two Hermes profiles, same identity        | Lock collision                             | Second fails fast with actionable message (`telegram.py` precedent)      |
@@ -558,8 +541,8 @@ Integration smoke (T8.*) uses the real SDK against a local `nats-server` — the
 5. **Cancellation detection (§6.7)** — MVP runs to completion on caller drop. A periodic `stream.ask("alive?")` liveness probe is a candidate follow-up.
 6. **Server-side `max_payload` enforcement** — trust the SDK's caller-side check; revisit if abuse is observed.
 7. **Activity-aware `status:ack` cadence** — fixed 20 s tick. Revisit if caller logs get noisy.
-8. **`x-session` rate-limiting / validation** — trust NATS account-level auth to gate publishers.
-9. **Per-session `natsagent.Agent` registration** — one registration per Hermes instance; `x-session` in the envelope distinguishes conversations (§3.3 would allow the alternative but it's heavyweight).
+8. **`envelope.session` rate-limiting / validation** — trust NATS account-level auth to gate publishers.
+9. **Per-session `natsagent.Agent` registration** — one registration per Hermes instance; `envelope.session` in the envelope distinguishes conversations (§3.3 would allow the alternative but it's heavyweight).
 
 ---
 
@@ -649,18 +632,18 @@ nats sub 'agents.hermes.*.*.heartbeat'
 
 ## 16. Decision log (for reviewer)
 
-- **Session identity is `x-session` in the envelope, not `metadata.session`** on the registration. Keeps one registration per Hermes instance (§3.3 would allow per-session, but the overhead isn't justified).
-- **Default `x-session` is `"default"`** — matches Appendix C guidance for session-less harnesses (`openclaw`) and preserves `nats pub` plain-text testability.
+- **Session identity is `envelope.session` in the envelope, not `metadata.session`** on the registration. Keeps one registration per Hermes instance (§3.3 would allow per-session, but the overhead isn't justified).
+- **Default `envelope.session` is `"default"`** — matches Appendix C guidance for session-less harnesses (`openclaw`) and preserves `nats pub` plain-text testability.
 - **NATS bypasses `GatewayStreamConsumer`** — it's designed for edit-based transports; NATS semantics (each chunk is a separate publish) don't match. Follow `api_server.py` pattern instead.
 - **New `request_interaction` hook is capability-gated**, not a cross-platform refactor. Non-NATS adapters keep their current (mostly non-functional) approval flow unchanged.
 - **`status:ack` is a fixed 20 s tick** for MVP simplicity; knob exists for later activity-aware tuning.
-- **Parse `x-session` from raw bytes** (option (b) in §3) as a local workaround; upstream the raw-handle to the SDK as follow-up.
+- **Parse `envelope.session` from raw bytes** (option (b) in §3) as a local workaround; upstream the raw-handle to the SDK as follow-up.
 - **Lock scope is `"nats"` + `"{agent}:{owner}:{name}"`** identity — matches the resource being guarded (the wire subject), not the server URL.
 
 Open for reviewer input:
 
 1. Should the SDK change (adding raw-bytes access to the handler) be upstreamed before we ship, or after? (Recommendation: after; use option (b) now.)
-2. Should the adapter register a single `Agent` or one per active `x-session`? (Recommendation: single; rationale in §13(9).)
+2. Should the adapter register a single `Agent` or one per active `envelope.session`? (Recommendation: single; rationale in §13(9).)
 3. Do we expose `ack_keepalive_interval_s` in config, or hard-code? (Recommendation: expose, with 20 s default.)
 4. Do we want a metric/log for "prompt received but session mismatched expectations" (e.g. envelope-parse failures with JSON-looking body)? (Recommendation: log at warning; no metric in MVP.)
 
@@ -729,7 +712,7 @@ The lesson compounds §17.4: if there's a canonical template for a side effect t
 
 ### 17.8 Per-session `asyncio.Lock` for a "request/reply" transport that supports concurrent sessions
 
-NATS's protocol is "request/reply" at a message level, but two callers can target the same `x-session` string simultaneously. Our MVP's single-registration-per-Hermes-instance choice (§13(9)) compresses that into one adapter handling both concurrent prompts. Per-session serialization (§17.2) turned out to be the minimum-viable correctness story here — the same approach would apply to any transport where "session" is a caller-supplied field rather than a transport-enforced identifier.
+NATS's protocol is "request/reply" at a message level, but two callers can target the same `envelope.session` string simultaneously. Our MVP's single-registration-per-Hermes-instance choice (§13(9)) compresses that into one adapter handling both concurrent prompts. Per-session serialization (§17.2) turned out to be the minimum-viable correctness story here — the same approach would apply to any transport where "session" is a caller-supplied field rather than a transport-enforced identifier.
 
 Design choices that ended up load-bearing:
 
@@ -738,11 +721,13 @@ Design choices that ended up load-bearing:
 - `_session_locks` is cleared in `_teardown_handles()`: reconnects don't inherit locks held by cancelled tasks.
 - Distinct `chat_id`s still run in parallel: the lock is per-session, not global.
 
-### 17.9 Private-attribute peek (stream._request.data) is an acceptable MVP crutch
+### 17.9 Private-attribute peek (stream._request.data) was an acceptable MVP crutch — now retired
 
-Design doc §3 flagged option (b) — peeking the SDK's `stream._request.data` to extract `x-session` before the SDK's `Envelope` decoder drops the field per `extra="ignore"`. It was shipped and stayed private-attribute-dependent through Phase 8. The failure mode is loud (AttributeError at handler entry) and confined (falls back to session default), which makes it a defensible MVP crutch rather than a landmine.
+**Status: resolved post-Phase 9.** The SDK now exposes `session` as a first-class `Envelope` field, and the adapter reads `envelope.session` directly. The paragraphs below are preserved as the original rationale for the workaround that shipped in Phases 4–8.
 
-The cleaner long-term fix is an upstream change to `nats-ai-pysdk` exposing raw bytes on the handler signature. Non-trivial to upstream, and Phase 8's verification shows the private-access approach works reliably in practice. Filing as follow-up rather than a blocker is the right call.
+Design doc §3 flagged option (b) — peeking the SDK's `stream._request.data` to extract the session value before the SDK's `Envelope` decoder drops the field per `extra="ignore"`. It was shipped and stayed private-attribute-dependent through Phase 8. The failure mode is loud (AttributeError at handler entry) and confined (falls back to session default), which makes it a defensible MVP crutch rather than a landmine.
+
+The cleaner long-term fix was an upstream change to `nats-ai-pysdk` exposing the field on `Envelope`. That shipped; the crutch (`_extract_session` + `_extract_x_session`) was removed in the same pass that updated this doc. Filing as follow-up rather than a blocker turned out to be the right call.
 
 ### 17.10 `entry_id` threading for parallel subagents fits under the "structural" umbrella
 

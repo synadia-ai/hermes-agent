@@ -4364,9 +4364,9 @@ class GatewayRunner:
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
         # NATS events are authenticated at the NATS server layer (accounts,
-        # NKey / JWT / TLS) per design doc §10.1 — the ``x-session`` value
-        # we use as user_id is caller-supplied routing metadata, not an
-        # authenticated principal, so the gateway's user allowlist doesn't
+        # NKey / JWT / TLS) per design doc §10.1 — the envelope ``session``
+        # value we use as user_id is caller-supplied routing metadata, not
+        # an authenticated principal, so the gateway's user allowlist doesn't
         # apply. Without this branch, ``/help`` over NATS replies with a
         # pairing code instead of the help text.
         if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.NATS):

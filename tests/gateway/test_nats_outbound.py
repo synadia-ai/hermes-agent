@@ -16,7 +16,7 @@ Covers:
   ``_active_streams`` for the same chat_id; send helpers fired from the
   earlier handler's context still land on the earlier handler's reply
   subject.
-* Concurrent-``x-session`` regression test — two overlapping
+* Concurrent-``session`` regression test — two overlapping
   ``_on_prompt`` invocations with the same chat_id each fire send
   helpers, and each lands on its own stream. This is the T5.0 guard.
 
@@ -320,12 +320,12 @@ class TestResolveStream:
 
 
 # ---------------------------------------------------------------------------
-# Concurrent x-session regression — the T5.0 regression guard
+# Concurrent session regression — the T5.0 regression guard
 # ---------------------------------------------------------------------------
 
 
 class TestConcurrentSameSessionRegression:
-    """Two ``_on_prompt`` calls sharing an ``x-session`` must each deliver
+    """Two ``_on_prompt`` calls sharing an ``session`` must each deliver
     their send to their OWN stream, not the other handler's.
 
     Phase 6 follow-up: we now serialize same-session handlers via a
@@ -345,21 +345,18 @@ class TestConcurrentSameSessionRegression:
     ):
         adapter = _build_adapter()
 
-        # Two distinct streams arriving with the same x-session="shared".
+        # Two distinct streams arriving with the same session="shared".
         stream_a = _fake_stream()
         stream_b = _fake_stream()
 
         envelope_a = MagicMock()
         envelope_a.prompt = "prompt A"
         envelope_a.attachments = None
+        envelope_a.session = "shared"
         envelope_b = MagicMock()
         envelope_b.prompt = "prompt B"
         envelope_b.attachments = None
-
-        # Plumb the x-session hack — _extract_session reads
-        # stream._request.data and we want both to resolve to "shared".
-        stream_a._request.data = b'{"prompt":"prompt A","x-session":"shared"}'
-        stream_b._request.data = b'{"prompt":"prompt B","x-session":"shared"}'
+        envelope_b.session = "shared"
 
         path_a = tmp_file("a.png", b"\x89PNGfakeA")
         path_b = tmp_file("b.png", b"\x89PNGfakeB")
@@ -442,22 +439,22 @@ class TestConcurrentSameSessionRegression:
         self, monkeypatch, tmp_file
     ):
         """Serialization is per-``chat_id``, not global — distinct
-        ``x-session`` values MUST still run concurrently. Guards against
+        ``session`` values MUST still run concurrently. Guards against
         an accidental global lock regression.
         """
         adapter = _build_adapter()
 
         stream_a = _fake_stream()
         stream_b = _fake_stream()
-        stream_a._request.data = b'{"prompt":"A","x-session":"alice"}'
-        stream_b._request.data = b'{"prompt":"B","x-session":"bob"}'
 
         envelope_a = MagicMock()
         envelope_a.prompt = "A"
         envelope_a.attachments = None
+        envelope_a.session = "alice"
         envelope_b = MagicMock()
         envelope_b.prompt = "B"
         envelope_b.attachments = None
+        envelope_b.session = "bob"
 
         both_inside = asyncio.Event()
         a_inside = asyncio.Event()

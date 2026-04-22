@@ -108,7 +108,7 @@ Conversely, `gateway/run.py::_run_in_executor_with_context` uses `copy_context()
 
 ### Per-session serialization (structural race elimination)
 
-If your transport supports multiple concurrent prompts per session (e.g. NATS's `x-session` field lets multiple callers target the same session string simultaneously), a per-session `asyncio.Lock` inside the adapter eliminates entire classes of races structurally — concurrent-handler stream-registration overwrites, notify-callback overwrites, ambiguous contextvar fallbacks — by making the concurrent state impossible rather than reconciling it correctly.
+If your transport supports multiple concurrent prompts per session (e.g. NATS's envelope `session` field lets multiple callers target the same session string simultaneously), a per-session `asyncio.Lock` inside the adapter eliminates entire classes of races structurally — concurrent-handler stream-registration overwrites, notify-callback overwrites, ambiguous contextvar fallbacks — by making the concurrent state impossible rather than reconciling it correctly.
 
 Canonical pattern (`NatsAdapter`):
 

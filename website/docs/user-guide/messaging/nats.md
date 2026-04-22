@@ -57,7 +57,7 @@ platforms:
       name: gateway                  # required
 
       # Behavior tuning (all optional, defaults shown)
-      session_default: "default"     # x-session fallback
+      session_default: "default"     # session fallback
       heartbeat_interval_s: 30
       max_payload: "1MB"
       attachments_ok: true
@@ -140,7 +140,7 @@ You'll see the response stream chunk-by-chunk, terminated by an empty-body frame
 
 ### Sessions
 
-The gateway treats each caller-supplied `x-session` field in the envelope as an independent conversation. Callers that don't set the field share the default session. Sessions are isolated from each other — one caller's history doesn't leak to another. Under the hood, `x-session=foo` produces a gateway session key of `agent:main:nats:dm:foo`.
+The gateway treats each caller-supplied `session` field in the envelope (protocol §5.1) as an independent conversation. Callers that don't set the field share the default session. Sessions are isolated from each other — one caller's history doesn't leak to another. Under the hood, `session=foo` produces a gateway session key of `agent:main:nats:dm:foo`. In the Python SDK, pass the field via `remote.prompt(text, session="foo")`; the examples expose it as `--session NAME`.
 
 ### Attachments
 
