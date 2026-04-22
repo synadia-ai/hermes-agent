@@ -99,7 +99,7 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 - [x] **T8.5** — `examples/04-query-reply.py` — tool call that requires approval; Query chunk; reply "once"; stream resumes
 - [x] **T8.6** — `examples/05-liveness.py` in background; kill hermes; `is_online()` flips False after 3× interval
 - [x] **T8.7** — `nats` CLI interop — `nats req '$SRV.INFO.SynadiaAgents'` and `nats sub 'agents.hermes.*.*.heartbeat'` per protocol Appendix C
-- [x] **T8.8** — `scripts/run_tests.sh` — full suite: 19 failures, all pre-existing / environmental, zero in the NATS subtree (195/195 green)
+- [x] **T8.8** — `scripts/run_tests.sh` — full suite: 19 failures, all pre-existing / environmental, zero in the NATS subtree (NATS subtree 201/201 green after the Phase 8 attachment-drop fix added 6 regression tests)
 
 ### Phase 9 — Polish & docs
 
