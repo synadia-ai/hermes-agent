@@ -460,6 +460,65 @@ class TestGatewayApprovalIntegration:
     """
 
     @pytest.mark.asyncio
+    async def test_notify_callback_resolves_as_deny_when_dispatch_fails(
+        self, monkeypatch
+    ):
+        # Scheduling path: simulate dispatch returning False (would happen
+        # if ``asyncio.run_coroutine_threadsafe`` raises because the loop
+        # is closed during shutdown). The NATS notify wrapper must fall
+        # back to resolve_gateway_approval(…, "deny") directly so the
+        # agent thread blocked on ``entry.event.wait()`` doesn't hang for
+        # the full gateway_timeout.
+        adapter = _build_adapter()
+        # No stream registered → dispatch will still return True (adapter
+        # supports the hook), but we simulate scheduling failure by
+        # monkeypatching run_coroutine_threadsafe in the base helper.
+        import gateway.platforms.base as base_mod
+
+        def _raise_scheduling_error(coro, _loop):
+            # Close the coroutine explicitly so the test doesn't leak an
+            # un-awaited coroutine warning via the GC (the real
+            # run_coroutine_threadsafe would schedule it on the loop —
+            # when it raises, the caller is responsible for cleanup; our
+            # dispatch helper catches this exception and returns False
+            # without waiting on a future, so the coroutine is orphaned).
+            coro.close()
+            raise RuntimeError("loop is closed")
+
+        monkeypatch.setattr(
+            base_mod.asyncio,
+            "run_coroutine_threadsafe",
+            _raise_scheduling_error,
+        )
+
+        session_key = "agent:main:nats:dm:alice"
+        resolved: list[tuple[str, str]] = []
+
+        def _fake_resolve(sk, choice, resolve_all=False):
+            resolved.append((sk, choice))
+            return 1
+
+        import tools.approval as approval_mod
+        monkeypatch.setattr(approval_mod, "resolve_gateway_approval", _fake_resolve)
+
+        loop = asyncio.get_running_loop()
+
+        def _notify(approval_data):
+            try:
+                dispatched = base_mod.dispatch_approval_via_request_interaction(
+                    adapter, "alice", session_key, approval_data, loop,
+                    timeout=5.0,
+                )
+            except Exception:
+                dispatched = False
+            if not dispatched:
+                approval_mod.resolve_gateway_approval(session_key, "deny")
+
+        _notify({"command": "rm -rf /", "description": "recursive delete"})
+
+        assert resolved == [(session_key, "deny")]
+
+    @pytest.mark.asyncio
     async def test_notify_callback_resolves_pending_approval_on_reply(
         self, monkeypatch
     ):

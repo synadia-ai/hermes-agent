@@ -1120,7 +1120,7 @@ class NatsAdapter(BasePlatformAdapter):
         # the agent thread waiting on the ApprovalEntry event.
         def _nats_approval_notify(approval_data: dict) -> None:
             try:
-                dispatch_approval_via_request_interaction(
+                dispatched = dispatch_approval_via_request_interaction(
                     self,
                     chat_id,
                     session_key,
@@ -1135,6 +1135,27 @@ class NatsAdapter(BasePlatformAdapter):
                     session_key,
                     exc,
                 )
+                dispatched = False
+            if not dispatched:
+                # Dispatch either found the adapter didn't override (cannot
+                # happen for NATS — it always overrides) or scheduling on
+                # ``loop`` raised (only during a shutdown race, when the loop
+                # is already closed). Fail safe: resolve as "deny" right now
+                # so the agent thread blocked on ``entry.event.wait()``
+                # unblocks immediately instead of hanging for the full
+                # ``gateway_timeout`` (default 300 s) before the framework
+                # times out by itself.
+                try:
+                    from tools.approval import resolve_gateway_approval
+                    resolve_gateway_approval(session_key, "deny")
+                except Exception as exc:
+                    logger.error(
+                        "[%s] Fallback resolve_gateway_approval failed "
+                        "(session=%s): %s",
+                        self.name,
+                        session_key,
+                        exc,
+                    )
 
         # Bind the approval session key on this worker thread's contextvar
         # so ``get_current_session_key`` inside ``check_all_command_guards``

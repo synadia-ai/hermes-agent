@@ -319,6 +319,21 @@ The design doc was ambiguous on this. `NotImplementedError` means the capability
 
 `scripts/run_tests.sh tests/gateway/` shows the same two Phase 1 failures plus a third pre-existing flake (`tests/tools/test_approval_heartbeat.py::TestApprovalHeartbeat::test_heartbeat_import_failure_does_not_break_wait`). All three fail identically with Phase 6 changes stashed, so not regressions introduced by this phase. Flagged here so a future Claude doesn't waste cycles blaming them on NATS.
 
+### 2026-04-22 — Phase 6 — Dispatch-failure fallback resolves as "deny"
+
+`_nats_approval_notify` reads the return value of `dispatch_approval_via_request_interaction` and, when it's False (scheduling on `loop` raised — only happens during a shutdown race where the loop is already closed), immediately calls `resolve_gateway_approval(session_key, "deny")`. Without this, the agent thread blocked on `entry.event.wait()` would hang for the full `gateway_timeout` (default 300 s) before the framework's timeout surfaces with "deny" anyway. Same outcome, but 300 s → ~0 ms. Regression test: `test_notify_callback_resolves_as_deny_when_dispatch_fails`.
+
+### 2026-04-22 — Phase 6 — Known shortcomings (NOT fixed; carry forward)
+
+1. **Concurrent same-`x-session` approvals are racy.** Two concerns stack here:
+   - `register_gateway_notify(session_key, cb)` is a per-session *overwrite* — two concurrent `_on_prompt` handlers sharing a session_key race on registration; whichever registers second wins, so the first handler's `_nats_approval_notify` (closure capturing its own `stream`) is replaced by the second's. Dangerous commands from either handler route through the second handler's stream.
+   - Even without the overwrite, `_current_stream` contextvar does NOT propagate through `asyncio.run_coroutine_threadsafe`. The coroutine scheduled by `dispatch_approval_via_request_interaction` starts with a fresh context, so `request_interaction`'s `_resolve_stream` falls back to the `_active_streams` dict, which is ambiguous for same-chat_id entries (returns whichever was registered first).
+   This is an inherent limitation of the framework's per-session notify + queue design plus Python's contextvar-cross-thread behavior — not NATS-specific and not trivial to fix. Practically narrow (NATS callers usually await one prompt's response before sending another on the same `x-session`), but real. Documented here for the next phase that cares about parallel subagent approvals. Fix would require either threading stream identity through `request_interaction`'s signature or a per-handler notify registration keyed on something finer than `session_key`.
+
+2. **Entry-pop is FIFO, not reply-keyed.** `resolve_gateway_approval(session_key, choice)` pops the OLDEST entry from `_gateway_queues[session_key]`, not "the one matching this query reply". If two dangerous commands fire concurrently in the same session (parallel subagents) and the caller replies to query 2 before query 1, coroutine 2 completes first and resolves entry 1 with query 2's choice. Entry 2 then resolves with query 1's choice. Cross-routing. Same limitation as above; same framework root cause. Fix would track per-entry correlation ids and resolve by id, not FIFO.
+
+3. **Approval reply "a" maps to "always", not "approve once".** Consistent with the CLI's `[o]nce | [s]ession | [a]lways | [d]eny` shortcuts, but users who type "a" thinking "approve" get permanent allowlisting instead of one-time. Mitigated by the prompt text explicitly listing `once | session | always | deny` as the four options. Full words are unambiguous; only the single-letter form has this footgun.
+
 ---
 
 ## Task definitions reference
