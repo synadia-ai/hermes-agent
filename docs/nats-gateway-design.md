@@ -1,9 +1,9 @@
 # NATS Gateway Channel — Design Doc
 
-**Status:** Draft (Phase 0 deliverable, pending review before any code changes)
-**Scope:** Add NATS as a new gateway channel in Hermes Agent so callers can prompt the agent over NATS — send text, send attachments, and receive token-streamed responses — using the **NATS Agent Protocol v0.2**.
-**Wire spec:** `../nats-agent-sdk-docs/core-protocol.md` (v0.2.0-draft).
-**Agent-side SDK:** `natsagent` at `../synadia-agents/client-sdk/python` (the SDK now lives inside the `synadia-ai/synadia-agents` monorepo; `client-sdk/python` is its subtree).
+**Status:** Living doc — Phase 10 migration to protocol v0.3 is the current shipped state.
+**Scope:** NATS as a gateway channel in Hermes Agent so callers can prompt the agent over NATS — send text, send attachments, and receive token-streamed responses — using the **NATS Agent Protocol v0.3**.
+**Wire spec:** `../nats-agent-sdk-docs/core-protocol.md` (v0.3).
+**Agent-side SDK:** `synadia-ai-agents` at `../synadia-agents/client-sdk/python` (PyPI package `synadia-ai-agents`, import root `synadia_ai.agents`; the SDK lives inside the `synadia-ai/synadia-agents` monorepo, `client-sdk/python` is its subtree).
 
 Cross-references to the protocol spec are by section number (e.g. §5.6). Cross-references to the Hermes codebase use `file:line`.
 
@@ -11,56 +11,59 @@ Cross-references to the protocol spec are by section number (e.g. §5.6). Cross-
 
 ## 1. Summary
 
-Add `gateway/platforms/nats.py` as a new `BasePlatformAdapter` subclass. It registers one `natsagent.Agent` with the identity `agents.hermes.<owner>.<name>` at gateway startup; each inbound `prompt` is translated into a Hermes `MessageEvent`, routed through the normal gateway handler, streamed back chunk-by-chunk over NATS, and terminated by the SDK's empty-body terminator.
+`gateway/platforms/nats.py` is a `BasePlatformAdapter` subclass. It registers one `synadia_ai.agents.AgentService` with the identity `agents.prompt.hermes.<owner>.<session_name>` at gateway startup; each inbound `prompt` is translated into a Hermes `MessageEvent`, routed through the normal gateway handler, streamed back chunk-by-chunk over NATS, and terminated by the SDK's empty-body terminator.
 
-Session routing uses the caller-supplied envelope field `session` (protocol §5.1, optional string). Mid-stream approvals round-trip via `PromptStream.ask()`. Attachments round-trip base64 ↔ Hermes media cache. The adapter owns its own `AIAgent` construction and streaming pipeline (api_server-style), bypassing the gateway's `GatewayStreamConsumer` — see §6 for why.
+Session routing uses the **5th subject token** (`session_name`) — v0.3 collapsed `Envelope.session` into the subject itself. Each `AgentService` serves exactly one session; multi-session deployments use Hermes profile isolation (one profile = one service). Mid-stream approvals round-trip via `PromptStream.ask()`. Attachments round-trip base64 ↔ Hermes media cache. The adapter owns its own `AIAgent` construction and streaming pipeline (api_server-style), bypassing the gateway's `GatewayStreamConsumer` — see §6 for why.
 
-Explicit non-goals: the future `attachments` endpoint (§5.5), JetStream at-least-once, E2E encryption, cross-platform adapter-level approval refactor. All are carried forward in §13.
+Explicit non-goals: the future `attachments` endpoint (§5.5), JetStream at-least-once, E2E encryption, cross-platform adapter-level approval refactor, multi-session multiplexing within one process. All are carried forward in §13.
 
 ---
 
 ## 2. Protocol ↔ Adapter mapping
 
-| Direction | Protocol (v0.2)                                                   | Adapter surface                                                                                     |
-|-----------|-------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| Inbound   | `Envelope.prompt`                                                 | `MessageEvent.text`                                                                                  |
-| Inbound   | `Envelope.attachments[i]` (base64)                                 | Decoded via `att.to_bytes()`, routed through `cache_{image,audio,document,video}_from_bytes` → `MessageEvent.media_urls` / `media_types` |
-| Inbound   | `Envelope.session` (§5.1 optional field)                           | `SessionSource.chat_id` — opaque session string, default `"default"`                                 |
-| Inbound   | `agents.hermes.<owner>.<name>` subject (prompt endpoint)           | Implicit — SDK dispatches to `Agent.on_prompt()`                                                     |
-| Outbound  | `{type: response, data: "<text>"}` (§6.3 bare-string form)         | `stream.send(ResponseChunk(text=delta))` via adapter-local `stream_delta_callback`                   |
-| Outbound  | `{type: response, data: {text, attachments: [...]}}`               | `send_image_file()` / `send_document()` / `send_voice()` / `send_video()` → `ResponseChunk(text=caption, attachments=[Attachment.from_path(...)])` |
-| Outbound  | `{type: status, data: "ack"}` (§6.4)                               | Keep-alive emitted every ~20 s while the handler is silent (see §6.2)                                |
-| Outbound  | `{type: query, data: {...}}` (§7.1)                                | `adapter.request_interaction()` → `stream.ask(prompt, timeout=…)`                                    |
-| Outbound  | Empty-body terminator (§6.5)                                       | Emitted automatically by the SDK when `_on_prompt()` returns (see `agent.py:278`)                    |
-| Outbound  | Error-headered frame + terminator (§9.3)                           | Raise from `_on_prompt()`; SDK calls `respond_error(...)` + terminator                               |
-| Liveness  | `agents.hermes.<owner>.<name>.heartbeat` (§8)                      | Automatic, SDK-owned — we pass `heartbeat_interval_s` only                                           |
-| Discovery | `$SRV.PING.agents`, `$SRV.INFO.agents[.{id}]` (§4) | Automatic — SDK registers as a NATS micro service                                                    |
-| Cancel    | None (§6.7 — interest-based, no wire signal)                       | MVP: no detection. Agent runs to completion. Revisit post-MVP with a periodic `stream.ask("alive?")` |
+| Direction | Protocol (v0.3)                                                            | Adapter surface                                                                                                                                    |
+|-----------|----------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| Inbound   | `Envelope.prompt`                                                          | `MessageEvent.text`                                                                                                                                 |
+| Inbound   | `Envelope.attachments[i]` (base64)                                         | Decoded via `att.to_bytes()`, routed through `cache_{image,audio,document,video}_from_bytes` → `MessageEvent.media_urls` / `media_types`            |
+| Inbound   | 5th subject token (`session_name`)                                         | `SessionSource.chat_id` — fixed per service, sourced from `settings.session_name`                                                                   |
+| Inbound   | `agents.prompt.hermes.<owner>.<session_name>` (prompt endpoint, v0.3)      | Implicit — SDK dispatches to `AgentService.on_prompt()`                                                                                              |
+| Inbound   | `agents.status.hermes.<owner>.<session_name>` (status endpoint, v0.3 PR#24)| SDK-owned — replies with the current heartbeat-shaped JSON on demand                                                                                |
+| Outbound  | `{type: response, data: "<text>"}` (§6.3 bare-string form)                 | `stream.send(ResponseChunk(text=delta))` via adapter-local `stream_delta_callback`                                                                   |
+| Outbound  | `{type: response, data: {text, attachments: [...]}}`                       | `send_image_file()` / `send_document()` / `send_voice()` / `send_video()` → `ResponseChunk(text=caption, attachments=[Attachment.from_path(...)])`   |
+| Outbound  | `{type: status, data: "ack"}` (§6.4)                                       | Keep-alive emitted every ~20 s while the handler is silent (see §6.2)                                                                                |
+| Outbound  | `{type: query, data: {...}}` (§7.1)                                        | `adapter.request_interaction()` → `stream.ask(prompt, timeout=…)`                                                                                    |
+| Outbound  | Empty-body terminator (§6.5)                                               | Emitted automatically by the SDK when `_on_prompt()` returns                                                                                         |
+| Outbound  | Error-headered frame + terminator (§9.3)                                   | Raise from `_on_prompt()`; SDK calls `respond_error(...)` + terminator                                                                               |
+| Liveness  | `agents.hb.hermes.<owner>.<session_name>` (v0.3 verb-first heartbeat)      | Automatic, SDK-owned — we pass `heartbeat_interval_s` only                                                                                            |
+| Liveness  | Reply inbox prefix `_INBOX.agents` (v0.3 PR#25, caller-side)               | Informational — service-side. Document in NATS account permissions (`_INBOX.agents.>` for caller principals)                                          |
+| Discovery | `$SRV.PING.agents`, `$SRV.INFO.agents[.{id}]`                              | Automatic — SDK registers as a NATS micro service                                                                                                    |
+| Cancel    | None (§6.7 — interest-based, no wire signal)                               | MVP: no detection. Agent runs to completion. Revisit post-MVP with a periodic `stream.ask("alive?")`                                                 |
 
 ### Key points
 
-- **SDK owns**: subject construction (§2), service registration (§3), envelope parsing (§5), chunk wrapping (§6.2/6.3), terminator (§6.5), error frames (§9), heartbeat emission (§8).
+- **v0.3 verb-first subjects:** every endpoint gets a verb token before the identity tuple — `agents.prompt.{a}.{o}.{s}`, `agents.hb.{a}.{o}.{s}`, `agents.status.{a}.{o}.{s}`. `metadata.protocol_version` is `"0.3"`.
+- **SDK owns**: subject construction (§2), service registration (§3), envelope parsing (§5), chunk wrapping (§6.2/6.3), terminator (§6.5), error frames (§9), heartbeat emission (§8), the on-demand `agents.status` request endpoint, the `_INBOX.agents` caller reply prefix.
 - **SDK does NOT own**: `status:ack` keep-alive cadence (§6.4) — we must emit. Per the spec's recommended caller inactivity timeout (§6.6: 60 s), we keep silence below that by a comfortable margin.
 
 ---
 
 ## 3. Session model
 
-**Design decision:** caller-supplied `session` envelope field, default `"default"`.
+**Design decision (v0.3):** session is the **5th subject token** (`session_name`), fixed per `AgentService`. One service = one session_name; multi-session deployments use Hermes profile isolation.
 
-### Why a caller-supplied field
+### Why a fixed-per-service session
 
-- Protocol §5.1 makes `session` an optional top-level envelope field. The `natsagent` SDK models it as `Envelope.session: str | None`.
-- The protocol's `metadata.session` (§3.2) identifies the *agent instance*, not the *conversation*. Using a single agent instance with per-caller session scoping is cheaper than spawning one NATS registration per Hermes session (§3.3 allows it but it's heavyweight).
-- Keeps the NATS wire shape compatible with `nats pub` plain-text testing (default falls through when no envelope field is set).
+- Protocol v0.3 (PR #26) collapsed `name` and `session` into a single `session_name`. `metadata.session`, `Envelope.session`, `HeartbeatPayload.session`, `AgentService(session=...)` and `Agent.prompt(session=...)` were all removed. "A worker that wants N sessions registers N services."
+- Hermes profile isolation already separates `HERMES_HOME`, config, sessions, memory, and per-platform locks per profile. One profile = one `AgentService` = one `session_name` is the natural fit and requires no additional plumbing.
+- Removes the v0.2 envelope.session demux + per-chat_id Lock pool entirely — the lock collapses to a single `_session_lock` and stream resolution becomes unambiguous.
 
 ### Inbound translation
 
 ```text
-envelope.session  (string or None)
+5th subject token (session_name, fixed at service start)
      │
      ▼
-chat_id = (envelope.session or "").strip() or session_default
+chat_id = self._settings.session_name
      │
      ▼
 SessionSource(
@@ -78,16 +81,18 @@ build_session_key(source, group_sessions_per_user=True)
 
 This lands in exactly the same shape the rest of the gateway already handles — `handle_message()` on the base class does its usual routing, pending-message draining, and session bookkeeping without special-casing NATS.
 
-### Reading `session`
+### Multi-session deployments
 
-The SDK exposes `session` as a first-class field on the parsed `Envelope`, so the adapter reads it directly:
+To run N sessions on one host, run N profiles:
 
-```python
-# gateway/platforms/nats.py::_on_prompt
-chat_id = (envelope.session or "").strip() or self._session_default()
+```bash
+hermes -p alice profile create
+hermes -p alice setup            # HERMES_NATS_SESSION_NAME=alice
+hermes -p bob profile create
+hermes -p bob setup              # HERMES_NATS_SESSION_NAME=bob
 ```
 
-No raw-bytes re-parse, no private attribute access. Earlier drafts of this doc and pre-0.1.1 SDK versions required the adapter to peek `stream._request.data` because the SDK's pydantic model dropped unknown fields via `extra="ignore"`; that workaround shipped in Phases 4–8 and was removed once the SDK landed first-class session support.
+Each profile registers its own `AgentService` at a distinct subject (`agents.prompt.hermes.<owner>.alice` vs `agents.prompt.hermes.<owner>.bob`) and acquires its own scoped lock. The platform-lock contract (§5) is unchanged — its identity simply uses `session_name` in place of v0.2's `name` token.
 
 ### Interaction with `group_sessions_per_user`
 
@@ -108,13 +113,13 @@ platforms:
       # OR
       context: "local-nats"               # $NATS_CONFIG_HOME/context/<name>.json
 
-      # Identity on the wire — produces subject agents.hermes.<owner>.<name>
+      # Identity on the wire — produces subject
+      # agents.prompt.hermes.<owner>.<session_name>
       agent: hermes                       # §2 token; default "hermes"
       owner: rene                         # §2 token; required
-      name: gateway                       # §2 token; required
+      session_name: default               # 5th subject token; required
 
       # Behavior tuning (all optional)
-      session_default: "default"          # envelope.session fallback
       heartbeat_interval_s: 30            # §8.2 default
       max_payload: "1MB"                  # §2.1 endpoint metadata
       attachments_ok: true                # §2.1 endpoint metadata
@@ -124,20 +129,19 @@ platforms:
 ### Validation (fails `_set_fatal_error(..., retryable=False)` in `__init__`)
 
 - Exactly one of `servers` (non-empty list of strings) or `context` (non-empty string) is set.
-- `owner` and `name` are non-empty strings conforming to §2.2 naming rules (the SDK's `AgentSubject.new()` enforces and sanitizes — but we fail fast with a readable error before construction).
-- `max_payload` parses via `natsagent._bytes.parse_human_bytes()` (the SDK will crash on construction otherwise).
+- `owner` and `session_name` are non-empty strings conforming to §2.2 naming rules (the SDK's `AgentSubject.new()` enforces and sanitizes — but we fail fast with a readable error before construction).
+- `max_payload` parses against the SDK's size grammar (the SDK will crash on construction otherwise).
 - `ack_keepalive_interval_s < 60` (leave headroom under §6.6's recommended 60 s caller inactivity timeout).
 
 ### Env var overrides (`_apply_env_overrides()` in `gateway/config.py`)
 
-| Env var               | Overrides                        | Notes                                                      |
-|-----------------------|----------------------------------|------------------------------------------------------------|
-| `NATS_URL`            | `extra.servers` (single-URL list) | Canonical env name in the NATS ecosystem                   |
-| `NATS_CONTEXT`        | `extra.context`                   | Matches `natsagent.connect(context=…)` semantics            |
-| `HERMES_NATS_AGENT`   | `extra.agent`                     | Optional; rarely overridden                                 |
-| `HERMES_NATS_OWNER`   | `extra.owner`                     | Common in multi-tenant deployments                          |
-| `HERMES_NATS_NAME`    | `extra.name`                      | Common when running multiple Hermes profiles                |
-| `HERMES_NATS_SESSION` | `extra.session_default`           | Rarely used; mostly for tests                               |
+| Env var                    | Overrides                        | Notes                                                      |
+|----------------------------|----------------------------------|------------------------------------------------------------|
+| `NATS_URL`                 | `extra.servers` (single-URL list) | Canonical env name in the NATS ecosystem                   |
+| `NATS_CONTEXT`             | `extra.context`                   | Splatted via `sdk.load_context_options(name)` into `nats.connect` |
+| `HERMES_NATS_AGENT`        | `extra.agent`                     | Optional; rarely overridden                                 |
+| `HERMES_NATS_OWNER`        | `extra.owner`                     | Common in multi-tenant deployments                          |
+| `HERMES_NATS_SESSION_NAME` | `extra.session_name`              | The 5th subject token; required                             |
 
 Pattern mirrors Signal (`gateway/config.py:926-943`): if the env var is set, ensure the platform entry exists, set `enabled=True`, and `update()` the `extra` dict.
 
@@ -158,14 +162,14 @@ Matches the existing "enabled AND has creds" pattern.
 
 ## 5. Profile isolation (scoped lock)
 
-Two Hermes profiles trying to register the **same** `(agent, owner, name)` would land on the same NATS inbox subject and both receive load-balanced prompts — silently wrong.
+Two Hermes profiles trying to register the **same** `(agent, owner, session_name)` would land on the same NATS prompt subject and both receive load-balanced prompts — silently wrong.
 
 **Lock scope:** `"nats"`
-**Lock identity:** `f"{agent}:{owner}:{name}"`
+**Lock identity:** `f"{agent}:{owner}:{session_name}"`
 
 ```python
-# in connect(), before natsagent.connect(...)
-if not self._acquire_platform_lock("nats", f"{agent}:{owner}:{name}", "NATS agent identity"):
+# in connect(), before nats.connect(...)
+if not self._acquire_platform_lock("nats", f"{agent}:{owner}:{session_name}", "NATS agent identity"):
     return False
 ```
 
@@ -188,12 +192,12 @@ NATS is request/reply: every chunk is a separate publish to the caller's reply s
 ### 6.2 Per-prompt lifecycle
 
 ```text
-NATS msg on agents.hermes.<owner>.<name>
+NATS msg on agents.prompt.hermes.<owner>.<session_name>
          │
          ▼
  SDK decodes envelope → calls adapter._on_prompt(envelope, stream)
          │
-         ├─── read envelope.session → chat_id
+         ├─── chat_id = settings.session_name (5th subject token)
          ├─── decode attachments → cache_* → media_urls/media_types
          ├─── build MessageEvent
          │
@@ -248,7 +252,6 @@ Specific cases handled explicitly:
 
 | Failure                          | Handling                                                                    |
 |----------------------------------|-----------------------------------------------------------------------------|
-| `envelope.session` is empty/blank | Fall back to `session_default` — matches spec §5.1 "optional" semantics     |
 | Attachment base64 invalid        | Raise `ProtocolError` → SDK responds 400                                    |
 | `attachments_ok=false` + atts    | Raise — SDK responds 400 per §5.4                                           |
 | Envelope > `max_payload`         | SDK caller-side enforcement (§5.4). Agent-side enforcement deferred (§13)   |
@@ -299,7 +302,7 @@ async def request_interaction(self, chat_id, prompt, *, kind, timeout):
         raise RuntimeError(f"no active NATS stream for chat_id={chat_id}")
     try:
         reply = await stream.ask(prompt, timeout=timeout)
-    except natsagent.QueryTimeout:
+    except sdk.QueryTimeout:
         return None
     return reply.prompt
 ```
@@ -392,26 +395,26 @@ NatsAdapter.__init__(config)
         ▼
 GatewayRunner.connect_all() → await adapter.connect()
         │
-        ├── _acquire_platform_lock("nats", f"{agent}:{owner}:{name}", ...)
-        ├── self._nc = await natsagent.connect(servers=..., context=...)
-        ├── self._agent = natsagent.Agent(agent=..., owner=..., name=..., nc=self._nc, ...)
-        ├── self._agent.on_prompt(self._on_prompt)
-        ├── await self._agent.start()    # registers micro service + starts heartbeat
+        ├── _acquire_platform_lock("nats", f"{agent}:{owner}:{session_name}", ...)
+        ├── self._nc = await nats.connect(servers=...)              # or **sdk.load_context_options(context)
+        ├── self._service = sdk.AgentService(agent=..., owner=..., session_name=..., nc=self._nc, ...)
+        ├── self._service.on_prompt(self._on_prompt)
+        ├── await self._service.start()  # registers micro service (prompt + status) + heartbeat
         └── self._mark_connected()
 ```
 
 ### Per-prompt
 
 ```
-natsagent SDK receives NATS msg
+synadia_ai.agents SDK receives NATS msg
         │
         ▼
-Agent._on_prompt_request → decode envelope → PromptStream → handler
+AgentService prompt endpoint → decode envelope → PromptStream → handler
         │
         ▼
 NatsAdapter._on_prompt(envelope, stream)
         │
-        ├── chat_id = envelope.session or settings.session_default
+        ├── chat_id = settings.session_name (5th subject token)
         ├── media = decode_attachments(envelope.attachments)
         ├── event  = MessageEvent(text=envelope.prompt, source=..., media_urls=..., ...)
         │
@@ -444,7 +447,7 @@ GatewayRunner.disconnect_all() → await adapter.disconnect()
         ├── signal cancellation to in-flight _on_prompt handlers
         │     (via asyncio.Event or task cancellation)
         ├── await all outstanding pump / keep-alive / _on_prompt tasks
-        ├── await self._agent.stop()     # stops heartbeat + deregisters micro service
+        ├── await self._service.stop()   # stops heartbeat + deregisters micro service
         ├── await self._nc.close()
         ├── _release_platform_lock()
         └── _mark_disconnected()
@@ -466,37 +469,39 @@ Output of commands lands in `stream.send(ResponseChunk(text=...))` the same way 
 
 | Scenario                                  | Detection                                 | Response                                                                |
 |-------------------------------------------|-------------------------------------------|-------------------------------------------------------------------------|
-| NATS server unreachable at connect        | `natsagent.connect` raises                | `_set_fatal_error("nats_connect_error", ..., retryable=True)`; gateway may retry |
+| NATS server unreachable at connect        | `nats.connect` raises                     | `_set_fatal_error("nats_connect_error", ..., retryable=True)`; gateway may retry |
 | Identity already locked on this host      | `_acquire_platform_lock` returns False    | `_set_fatal_error("nats_lock", ..., retryable=False)`; do not retry      |
 | NATS reconnect mid-stream                 | `stream.send` raises inside pump          | Log; agent continues to completion; SDK emits error frame                |
 | Caller drops reply subscription (§6.7)    | No detection in MVP                        | Agent runs to completion; published chunks dropped by NATS server        |
-| Oversize inbound envelope                 | `natsagent`'s caller-side §5.4 + our check | Reject before cache_*; raise → SDK `respond_error(400)`                  |
+| Oversize inbound envelope                 | SDK's caller-side §5.4 + our check         | Reject before cache_*; raise → SDK `respond_error(400)`                  |
 | Handler raises unexpectedly               | SDK wraps exception                        | `respond_error(500, <sanitized desc>)` then terminator                   |
-| `envelope.session` empty/blank/None       | SDK's pydantic field (`str | None`)        | Fall back to `session_default`                                           |
-| `max_payload` format bad at init          | `natsagent._bytes.parse_human_bytes` raise | `_set_fatal_error(...)` during `__init__`                                |
-| `owner`/`name` violate §2.2               | `AgentSubject.new()` raise                  | `_set_fatal_error(...)` during `connect()`                               |
+| `max_payload` format bad at init          | SDK size-grammar parser raises             | `_set_fatal_error(...)` during `__init__`                                |
+| `owner`/`session_name` violate §2.2       | `AgentSubject.new()` raise                 | `_set_fatal_error(...)` during `connect()`                               |
 | Two Hermes profiles, same identity        | Lock collision                             | Second fails fast with actionable message (`telegram.py` precedent)      |
 
 ---
 
 ## 12. Testing strategy
 
-Tests use `scripts/run_tests.sh` (hermetic wrapper). Mirror the Telegram collection-time mock so the suite runs without `natsagent` installed:
+Tests use `scripts/run_tests.sh` (hermetic wrapper). Mirror the Telegram collection-time mock so the suite runs without `synadia-ai-agents` installed:
 
 ```python
 # tests/gateway/conftest.py (addition)
-def _ensure_natsagent_mock() -> None:
-    if "natsagent" in sys.modules and hasattr(sys.modules["natsagent"], "__file__"):
+def _ensure_synadia_agents_mock() -> None:
+    if (
+        "synadia_ai.agents" in sys.modules
+        and hasattr(sys.modules["synadia_ai.agents"], "__file__")
+    ):
         return
     mod = MagicMock()
 
     # Connection factory
     mod.connect = AsyncMock()
 
-    # Agent / PromptStream — support await usage in tests
-    mod.Agent = MagicMock()
-    mod.Agent.return_value.start = AsyncMock()
-    mod.Agent.return_value.stop = AsyncMock()
+    # AgentService / PromptStream — support await usage in tests
+    mod.AgentService = MagicMock()
+    mod.AgentService.return_value.start = AsyncMock()
+    mod.AgentService.return_value.stop = AsyncMock()
     mod.PromptStream = MagicMock()
 
     # Exception types (real classes so `except` works)
@@ -513,9 +518,12 @@ def _ensure_natsagent_mock() -> None:
         def from_bytes(cls, filename, data): ...
     mod.Attachment = _FakeAttachment
 
-    sys.modules["natsagent"] = mod
+    parent = MagicMock()
+    parent.agents = mod
+    sys.modules["synadia_ai"] = parent
+    sys.modules["synadia_ai.agents"] = mod
 
-_ensure_natsagent_mock()
+_ensure_synadia_agents_mock()
 ```
 
 Test files (one file per table row):
@@ -541,8 +549,8 @@ Integration smoke (T8.*) uses the real SDK against a local `nats-server` — the
 5. **Cancellation detection (§6.7)** — MVP runs to completion on caller drop. A periodic `stream.ask("alive?")` liveness probe is a candidate follow-up.
 6. **Server-side `max_payload` enforcement** — trust the SDK's caller-side check; revisit if abuse is observed.
 7. **Activity-aware `status:ack` cadence** — fixed 20 s tick. Revisit if caller logs get noisy.
-8. **`envelope.session` rate-limiting / validation** — trust NATS account-level auth to gate publishers.
-9. **Per-session `natsagent.Agent` registration** — one registration per Hermes instance; `envelope.session` in the envelope distinguishes conversations (§3.3 would allow the alternative but it's heavyweight).
+8. **Caller rate-limiting / validation** — trust NATS account-level auth to gate publishers.
+9. **Multi-session multiplexing within one process** — v0.3 fixed: one `AgentService` = one `session_name` (PR #26). For N sessions, run N profiles. The v0.2 envelope.session demux is gone.
 
 ---
 
@@ -552,7 +560,7 @@ Installation (one-time):
 
 ```bash
 source venv/bin/activate
-pip install -e ../synadia-agents/client-sdk/python   # while natsagent is not yet on PyPI
+pip install -e ../synadia-agents/client-sdk/python   # while synadia-ai-agents is not yet on PyPI
 ```
 
 Local broker:
@@ -622,30 +630,21 @@ nats sub 'agents.hermes.*.*.heartbeat'
 | Connection gate                | `gateway/config.py::get_connected_platforms`         | Add NATS arm                                         |
 | Scoped lock primitive          | `gateway/status.py::acquire_scoped_lock`             | Signature: `(scope, identity, metadata=None)`        |
 | Session source + key           | `gateway/session.py`                                 | `SessionSource`, `build_session_key`                 |
-| Test mock pattern              | `tests/gateway/conftest.py::_ensure_telegram_mock`   | Mirror for `_ensure_natsagent_mock`                  |
+| Test mock pattern              | `tests/gateway/conftest.py::_ensure_telegram_mock`   | Mirror for `_ensure_synadia_agents_mock`             |
 | CLI approval callback          | `hermes_cli/callbacks.py` (reference only)           | CLI-only; gateway uses its own notify bridge         |
-| SDK source                     | `../synadia-agents/client-sdk/python/src/natsagent/` | `agent.py`, `envelope.py`, `messages.py`, `connect.py` |
+| SDK source                     | `../synadia-agents/client-sdk/python/src/synadia_ai/agents/` | `service.py`, `envelope.py`, `messages.py`, `connect.py` |
 | SDK examples                   | `../synadia-agents/client-sdk/python/examples/01..05-*.py` | Smoke-test inputs (§14)                        |
-| Protocol spec                  | `../nats-agent-sdk-docs/core-protocol.md`            | v0.2.0-draft                                         |
+| Protocol spec                  | `../nats-agent-sdk-docs/core-protocol.md`            | v0.3                                                 |
 
 ---
 
 ## 16. Decision log (for reviewer)
 
-- **Session identity is `envelope.session` in the envelope, not `metadata.session`** on the registration. Keeps one registration per Hermes instance (§3.3 would allow per-session, but the overhead isn't justified).
-- **Default `envelope.session` is `"default"`** — matches Appendix C guidance for session-less harnesses (`openclaw`) and preserves `nats pub` plain-text testability.
+- **Session identity is the 5th subject token (`session_name`)** — v0.3 PR #26 collapsed `name` and `session` into one. Hermes profile isolation provides multi-session deployments (one profile = one service = one `session_name`).
 - **NATS bypasses `GatewayStreamConsumer`** — it's designed for edit-based transports; NATS semantics (each chunk is a separate publish) don't match. Follow `api_server.py` pattern instead.
 - **New `request_interaction` hook is capability-gated**, not a cross-platform refactor. Non-NATS adapters keep their current (mostly non-functional) approval flow unchanged.
 - **`status:ack` is a fixed 20 s tick** for MVP simplicity; knob exists for later activity-aware tuning.
-- **Parse `envelope.session` from raw bytes** (option (b) in §3) as a local workaround; upstream the raw-handle to the SDK as follow-up.
-- **Lock scope is `"nats"` + `"{agent}:{owner}:{name}"`** identity — matches the resource being guarded (the wire subject), not the server URL.
-
-Open for reviewer input:
-
-1. Should the SDK change (adding raw-bytes access to the handler) be upstreamed before we ship, or after? (Recommendation: after; use option (b) now.)
-2. Should the adapter register a single `Agent` or one per active `envelope.session`? (Recommendation: single; rationale in §13(9).)
-3. Do we expose `ack_keepalive_interval_s` in config, or hard-code? (Recommendation: expose, with 20 s default.)
-4. Do we want a metric/log for "prompt received but session mismatched expectations" (e.g. envelope-parse failures with JSON-looking body)? (Recommendation: log at warning; no metric in MVP.)
+- **Lock scope is `"nats"` + `"{agent}:{owner}:{session_name}"`** identity — matches the resource being guarded (the wire subject), not the server URL.
 
 ---
 
@@ -670,6 +669,8 @@ Fixes in all three cases were identical in shape: **capture the contextvar value
 Phase 5's T5.0 shipped a contextvar-primary + compound-key-dict hybrid for concurrent same-session stream lookup. It was correct under most scenarios but fragile — e.g. sends scheduled across `run_coroutine_threadsafe` boundaries fell through to the dict-lookup fallback, which was order-dependent when multiple streams shared a `chat_id`. Phase 6 initially stacked a second reconciliation layer on top (closure-captured streams inside notify callbacks) and a third (`register_gateway_notify` overwrite semantics).
 
 The third attempt replaced all of it with a per-`chat_id` `asyncio.Lock`: at most one handler per session at any instant, so stream-ambiguity and callback-overwrite both became structurally impossible. The Phase 5 T5.0 regression test — which manually gated two handlers to overlap and asserted each send reached its own stream — became **deadlock-by-design under serialization** and was rewritten as a timeline-ordering assertion (A enter → A leave → B enter → B leave).
+
+**Phase 10 addendum (v0.3):** the per-`chat_id` Lock pool collapsed to a single `_session_lock` once the SDK pinned one `session_name` per service. The serialization invariant survived verbatim — what changed is that there's now exactly one Lock to hold, and `chat_id` is a constant of the process rather than a per-prompt input.
 
 **Generalizable rule.** When a correctness bug has the shape "multiple concurrent things of type X share state Y," serialize the entry to X before reconciling Y correctly. Losing a test that exercises "race-safe" machinery in favor of a test that exercises "no race possible" is a win. The opposite direction — retrofitting serialization after building reconciliation — is much more expensive because the reconciliation machinery spreads across the code.
 
@@ -710,24 +711,23 @@ The first-pass media-enrichment fix (adapter-local bracketed notes pointing the 
 
 The lesson compounds §17.4: if there's a canonical template for a side effect that every platform shares, adopting it verbatim is almost always the right call, even when a locally-cheaper alternative looks viable. The cost of "this adapter behaves subtly differently from the others" accumulates in every downstream feature.
 
-### 17.8 Per-session `asyncio.Lock` for a "request/reply" transport that supports concurrent sessions
+### 17.8 `asyncio.Lock` for a "request/reply" transport that supports concurrent prompts
 
-NATS's protocol is "request/reply" at a message level, but two callers can target the same `envelope.session` string simultaneously. Our MVP's single-registration-per-Hermes-instance choice (§13(9)) compresses that into one adapter handling both concurrent prompts. Per-session serialization (§17.2) turned out to be the minimum-viable correctness story here — the same approach would apply to any transport where "session" is a caller-supplied field rather than a transport-enforced identifier.
+NATS's protocol is "request/reply" at a message level, but two callers can hit the same prompt subject simultaneously. v0.2 had this aggravated by envelope.session demux on top of one adapter; v0.3 pinned one `session_name` per service, so the lock collapses from a per-`chat_id` pool to a single `_session_lock`. The serialization invariant remains: at most one handler in flight at a time. Same approach applies to any transport where the service hosts a single conversational session.
 
 Design choices that ended up load-bearing:
 
 - Keep-alive starts *before* the lock: a queued handler still emits `status:ack` chunks so the caller doesn't hit §6.6's inactivity timeout.
-- `_unpack_envelope` runs *before* the lock: attachment decode failures fail fast with an SDK 500, not blocked behind a busy-session queue.
-- `_session_locks` is cleared in `_teardown_handles()`: reconnects don't inherit locks held by cancelled tasks.
-- Distinct `chat_id`s still run in parallel: the lock is per-session, not global.
+- `_unpack_envelope` runs *before* the lock: attachment decode failures fail fast with an SDK 500, not blocked behind a busy queue.
+- `_session_lock` is rebuilt in `connect()`: reconnects don't inherit a Lock held by a cancelled task.
 
 ### 17.9 Private-attribute peek (stream._request.data) was an acceptable MVP crutch — now retired
 
-**Status: resolved post-Phase 9.** The SDK now exposes `session` as a first-class `Envelope` field, and the adapter reads `envelope.session` directly. The paragraphs below are preserved as the original rationale for the workaround that shipped in Phases 4–8.
+**Status: resolved post-Phase 9, then made moot in Phase 10.** Phase 9 saw the SDK expose `session` as a first-class `Envelope` field; Phase 10 removed `Envelope.session` entirely (v0.3 PR #26) and moved the session into the 5th subject token. The adapter now reads `settings.session_name` and never inspects the envelope for session identity.
 
-Design doc §3 flagged option (b) — peeking the SDK's `stream._request.data` to extract the session value before the SDK's `Envelope` decoder drops the field per `extra="ignore"`. It was shipped and stayed private-attribute-dependent through Phase 8. The failure mode is loud (AttributeError at handler entry) and confined (falls back to session default), which makes it a defensible MVP crutch rather than a landmine.
+Design doc §3 flagged option (b) — peeking the SDK's `stream._request.data` to extract the session value before the SDK's `Envelope` decoder drops the field per `extra="ignore"`. It was shipped and stayed private-attribute-dependent through Phase 8. The failure mode was loud (AttributeError at handler entry) and confined (falls back to session default), which made it a defensible MVP crutch rather than a landmine.
 
-The cleaner long-term fix was an upstream change to the `natsagent` SDK exposing the field on `Envelope`. That shipped; the crutch (`_extract_session` + `_extract_x_session`) was removed in the same pass that updated this doc. Filing as follow-up rather than a blocker turned out to be the right call.
+The cleaner long-term fix arrived in two stages: first the SDK exposed `session` on `Envelope` (Phase 9), then v0.3 collapsed it into the subject token (Phase 10). Filing as follow-up rather than a blocker turned out to be the right call.
 
 ### 17.10 `entry_id` threading for parallel subagents fits under the "structural" umbrella
 

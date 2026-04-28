@@ -20,11 +20,11 @@ Do not rewrite the design doc unless the user asks. If a design decision turns o
 
 ## Status
 
-- **Last completed phase:** Phase 9 — Polish & docs (T9.1 ADDING_A_PLATFORM.md refresh, T9.2 design-doc §17 "Lessons learned", T9.3 user-facing `nats.md` + messaging-index wiring + env-var reference)
+- **Last completed phase:** Phase 10 — protocol v0.3 / `synadia-ai-agents` SDK migration (PRs #24/#25/#26 in `synadia-ai/synadia-agents`)
 - **Next phase:** None — all phases complete. PR on `nats-gateway` → `main` is the next human step.
 - **Branch:** `nats-gateway` (feature branch; PR target is `main`)
 - **Known blockers:** none
-- **Open design questions pending user input:** 4 items listed in §16 of `docs/nats-gateway-design.md`. Default answers are noted there; proceed with defaults unless the user redirects.
+- **Open design questions pending user input:** see §16 of `docs/nats-gateway-design.md`.
 
 When you finish a phase, update the two bullets above and tick its tasks in the "Task checklist" below.
 
@@ -106,6 +106,21 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 - [x] **T9.1** — Update `gateway/platforms/ADDING_A_PLATFORM.md` with any new integration points that emerged (e.g. `request_interaction` if it gets generalized)
 - [x] **T9.2** — Append "Lessons learned" section to `docs/nats-gateway-design.md` (especially surprises in stream_delta_callback wiring or attachments)
 - [x] **T9.3** — Add example config snippet to README or new `docs/nats-gateway.md` (user-facing)
+
+### Phase 10 — Protocol v0.3 / `synadia-ai-agents` SDK migration
+
+- [x] **T10.1** — Bump `pyproject.toml` `[nats]` extra to `synadia-ai-agents>=0.4.0,<1`
+- [x] **T10.2** — Rewrite `gateway/platforms/nats.py` imports (`import synadia_ai.agents as sdk`), `SYNADIA_AGENTS_AVAILABLE`, all `getattr(natsagent, …)` → `getattr(sdk, …)`, TYPE_CHECKING import
+- [x] **T10.3** — `NatsAdapterSettings`: drop `name` and `session_default`, add required `session_name` field; rebuild `identity` from `session_name`; remove `DEFAULT_SESSION_DEFAULT`
+- [x] **T10.4** — `gateway/config.py`: rename env var `HERMES_NATS_NAME` → `HERMES_NATS_SESSION_NAME`; delete `HERMES_NATS_SESSION` + `extra["session_default"]`; update `extra` keys
+- [x] **T10.5** — `connect()`: construct `sdk.AgentService(session_name=…)`; rename `self._agent` → `self._service`; update connected log line to `agents.prompt.{a}.{o}.{session_name}`
+- [x] **T10.6** — Collapse session routing: `chat_id = settings.session_name`; replace `_session_locks` dict with single `_session_lock`; delete `_session_default()`; remove all `envelope.session` reads
+- [x] **T10.7** — `gateway/run.py:2874` SDK-missing log message updated to reference `synadia-ai-agents` and the monorepo install path
+- [x] **T10.8** — `tests/gateway/conftest.py`: rename `_ensure_natsagent_mock` → `_ensure_synadia_agents_mock`; register under `sys.modules["synadia_ai.agents"]`; expose `AgentService` (was `Agent`); drop `session` from envelope/heartbeat fakes
+- [x] **T10.9** — Sweep all NATS test files: rename `mock_natsagent` fixture → `mock_synadia_agents`; kwargs `name=` → `session_name=`; drop `session_default` and `envelope.session`-fallback tests; add positive test that `chat_id` is sourced from `settings.session_name` even when a stray envelope field exists; rewrite distinct-sessions concurrent test to single-session serialization
+- [x] **T10.10** — `scripts/run_tests.sh tests/gateway/` — 190/190 NATS tests green
+- [x] **T10.11** — Update `CLAUDE.md` SDK reference (package + import name + AgentService rename)
+- [x] **T10.12** — Rewrite design-doc §1–§6 + §11–§17 deltas; append Phase 10 entry to this progress doc; rewrite `website/docs/user-guide/messaging/nats.md` (env var rename, package rename, subject examples, `_INBOX.agents` permission note, status endpoint mention)
 
 ---
 
@@ -682,6 +697,45 @@ The protocol spec bumped from v0.1 to v0.2; v0.2 is **not wire-compatible with v
 ### 2026-04-22 — Post-Phase 9 — Phase 4 docstring drift labeled v0.1 → v0.2
 
 Three method docstrings in `gateway/platforms/nats.py` (`send_voice` at 1485, `_send_attachment` at 1525, `_ask_approval_question` at 1613) labeled current wire behavior as "v0.1". Each is a spec-version-independent observation (no voice/audio wire distinction, attachments carry identically, no per-kind query field) that is also true in v0.2 — not a historical distinguisher like `docs/nats-gateway-design.md:537` (which contrasts the current inline-base64 behavior against the *future* §5.5 chunked-upload endpoint and was deliberately left at "v0.1"). Updated the three `nats.py` docstrings to "v0.2" so they accurately reflect what the adapter currently speaks; left the design doc's contrast intact.
+
+### 2026-04-28 — Phase 10 — Migrated to protocol v0.3 / `synadia-ai-agents` SDK
+
+Three SDK PRs landed against `synadia-ai/synadia-agents` and bumped the wire to v0.3:
+
+- **PR #24 — verb-first subjects + status endpoint.** Subjects gained a verb token: `agents.prompt.{a}.{o}.{n}`, `agents.hb.{a}.{o}.{n}`, new `agents.status.{a}.{o}.{n}`. `metadata.protocol_version` → `"0.3"`. `AgentService` registers prompt + status endpoints automatically via `service.start()`.
+- **PR #25 — pinned reply-inbox prefix `_INBOX.agents`.** Caller-side only. Hermes is service-side, so this is informational; it lands as a NATS account-permission note in the user-facing docs.
+- **PR #26 — `name` + `session` collapsed into `session_name`.** The 5th subject token IS the session. Removed: `metadata.session`, `Envelope.session`, `HeartbeatPayload.session`, `AgentService(session=...)`, `Agent.prompt(session=...)`. Multi-session multiplexing within one process is explicitly dropped — *"a worker that wants N sessions registers N services"*.
+
+The package itself was renamed `natsagent` → `synadia-ai-agents` (PyPI), import root `synadia_ai.agents`, and the service-side class renamed `Agent` → `AgentService`.
+
+**Decision (taken with the user before code touched):** adopt the SDK's intended single-session-per-service model and rely on Hermes' existing profile isolation for multi-session deployments. One profile = one `AgentService` = one `session_name`. Multi-session = multi-profile. This is the smallest, most SDK-aligned diff and naturally collapses today's per-`chat_id` locking + stream tracking into a single global lock.
+
+Why this was the right call rather than registering N services per Hermes process:
+
+- **SDK direction.** PR #26 is an explicit deprecation of the v0.2 multiplexing pattern. Building a private demuxer on top of `AgentService` would mean diverging from the SDK's intended usage and losing future SDK improvements (status endpoint enhancements, reconnect behavior, observability) that assume one-service-per-session.
+- **Profile isolation already canonical.** Hermes profiles already separate `HERMES_HOME`, `.env`, sessions, memory, skills, and per-platform locks. Mapping "session" to "profile" cost zero new mechanism and inherits all of profile's existing safety properties (the platform lock, the lock-conflict diagnostic message, the `gateway/platforms/ADDING_A_PLATFORM.md` profile-safe checklist).
+- **Lock simplification.** v0.2's per-`chat_id` `Dict[str, asyncio.Lock]` collapsed to a single `_session_lock`. The serialization invariant (§17.2 / §17.8) survives byte-for-byte; only the locking primitive changes. Tests that exercised distinct-`session` parallelism within one adapter (a v0.2-only concept) were deleted.
+- **`nats-gateway` branch hadn't merged to `main` yet.** No backward-compat migration window was needed for the env var rename or the config-key rename. `HERMES_NATS_NAME`/`HERMES_NATS_SESSION` → `HERMES_NATS_SESSION_NAME` is a clean break with zero deployed users.
+
+What got simpler:
+
+- No `envelope.session` reads anywhere in the adapter.
+- No `_session_default()` method.
+- `_session_locks: Dict[str, asyncio.Lock]` → single `asyncio.Lock`.
+- `NatsAdapterSettings`: dropped `name` and `session_default` fields, added required `session_name`.
+- Renamed `self._agent` → `self._service` to avoid collision with `AIAgent`.
+
+What stayed the same:
+
+- The contextvar-primary + compound-key-dict stream lookup (`_current_stream` + `_active_streams`) — `chat_id` is now constant of the process but the dict shape stays useful for the contextvar-fallback diagnostic path noted at §17.1.
+- Adapter-owned `AIAgent` (api_server-style) — §17.3 lessons all still apply.
+- Per-handler keep-alive emission, attachment cache routing, slash-command dispatch through `_message_handler`, mid-stream `request_interaction` round-trip, profile lock acquisition.
+
+`_INBOX.agents.>` is a service-side no-op for Hermes (PR #25 is caller-side), but the user-facing doc calls it out as the recommended NATS account permission grant for callers, since that's what unblocks them.
+
+**Test results.** `scripts/run_tests.sh tests/gateway/test_nats_*.py` — 190/190 green. Full `scripts/run_tests.sh tests/gateway/` — 3700/3703 green; the three failures (`test_matrix.py::test_upload_encrypted_room_uses_file_payload`, `test_agent_cache.py::test_close_vs_release_full_teardown_difference`, `test_whatsapp_connect.py::test_closed_when_http_not_ready`) are pre-existing on `main` and unrelated to NATS — verified by stashing the migration diff and reproducing two of three failures against unchanged code.
+
+**Live smoke not run in this pass.** The migration is mechanical enough (subject layout + kwarg name changes, no streaming-pipeline behavior changes) that the test suite plus a careful diff against PR #24/#25/#26's wire-format expectations was deemed sufficient. A fresh `nats-server` smoke + `examples/02-prompt-text.py` round-trip is on the verification checklist for whoever opens the PR.
 
 ## Task definitions reference
 

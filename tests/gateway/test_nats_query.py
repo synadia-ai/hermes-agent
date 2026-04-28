@@ -17,7 +17,7 @@ Covers, per docs/nats-gateway-design.md §7:
   ``stream.ask`` fires AND ``resolve_gateway_approval`` is called with
   the normalized choice — i.e. the agent thread unblock path is wired.
 
-The SDK is still mocked via ``tests/gateway/conftest.py::_ensure_natsagent_mock``.
+The SDK is mocked via ``tests/gateway/conftest.py::_ensure_synadia_agents_mock``.
 No real NATS broker is touched.
 """
 
@@ -50,7 +50,7 @@ def _valid_extra(**overrides) -> dict:
     base = {
         "servers": ["nats://127.0.0.1:4222"],
         "owner": "rene",
-        "name": "gateway",
+        "session_name": "default",
         "ack_keepalive_interval_s": 1,
     }
     base.update(overrides)
@@ -263,7 +263,7 @@ class TestRequestInteraction:
     @pytest.mark.asyncio
     async def test_query_timeout_maps_to_none(self):
         adapter = _build_adapter()
-        query_timeout_cls = sys.modules["natsagent"].QueryTimeout
+        query_timeout_cls = sys.modules["synadia_ai.agents"].QueryTimeout
         stream = _fake_stream(raises=query_timeout_cls("no reply"))
         adapter._active_streams[("alice", id(stream))] = stream
 
@@ -372,7 +372,7 @@ class TestDispatchApproval:
     @pytest.mark.asyncio
     async def test_timeout_reply_resolves_as_deny(self, monkeypatch):
         adapter = _build_adapter()
-        query_timeout_cls = sys.modules["natsagent"].QueryTimeout
+        query_timeout_cls = sys.modules["synadia_ai.agents"].QueryTimeout
         stream = _fake_stream(raises=query_timeout_cls("no reply"))
         adapter._active_streams[("bob", id(stream))] = stream
 

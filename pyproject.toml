@@ -90,11 +90,12 @@ google = [
   "google-auth-oauthlib>=1.0,<2",
   "google-auth-httplib2>=0.2,<1",
 ]
-# NATS: natsagent is not yet published to PyPI. For now install the SDK from
-# source: `pip install -e ../synadia-agents/client-sdk/python` (the SDK lives
-# in the synadia-ai/synadia-agents monorepo). Once published, `pip install
-# 'hermes-agent[nats]'` will resolve the PyPI package.
-nats = ["natsagent>=0.2.0,<1"]
+# NATS: synadia-ai-agents is not yet published to PyPI. For now install the
+# SDK from source: `pip install -e ../synadia-agents/client-sdk/python`
+# (the SDK lives in the synadia-ai/synadia-agents monorepo, import root
+# `synadia_ai.agents`). Once published, `pip install 'hermes-agent[nats]'`
+# will resolve the PyPI package.
+nats = ["synadia-ai-agents>=0.4.0,<1"]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 web = ["fastapi>=0.104.0,<1", "uvicorn[standard]>=0.24.0,<1"]
 rl = [

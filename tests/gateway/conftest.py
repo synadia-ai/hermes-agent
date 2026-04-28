@@ -215,34 +215,36 @@ def _ensure_discord_mock() -> None:
     sys.modules["discord.ext.commands"] = commands_mod
 
 
-def _ensure_natsagent_mock() -> None:
-    """Install a minimal natsagent mock in sys.modules.
+def _ensure_synadia_agents_mock() -> None:
+    """Install a minimal synadia_ai.agents mock in sys.modules.
 
     Idempotent — skips when the real SDK is already imported. Mirrors the
     Telegram/Discord pattern so gateway tests can import the NATS adapter
-    module without requiring natsagent to be installed.
+    module without requiring synadia-ai-agents to be installed.
+
+    Also mocks ``nats`` (nats-py): the adapter calls ``nats.connect(...)``
+    directly because the SDK explicitly does NOT own NATS connections
+    (callers build the client and hand it to ``AgentService``).
     """
-    if "natsagent" in sys.modules and hasattr(sys.modules["natsagent"], "__file__"):
+    if (
+        "synadia_ai.agents" in sys.modules
+        and hasattr(sys.modules["synadia_ai.agents"], "__file__")
+    ):
         return  # Real SDK is installed — nothing to mock
 
     mod = MagicMock()
 
-    # Top-level connect() factory is awaited in the adapter. The returned
-    # NATS client exposes `.close()` as an awaitable (nats-py's Client.close
-    # is a coroutine), so pre-wire an AsyncMock on the MagicMock return
-    # value — otherwise `await nc.close()` in NatsAdapter.disconnect() blows
-    # up with "object MagicMock can't be used in 'await' expression" under
-    # the mock.
-    mod.connect = AsyncMock()
-    mod.connect.return_value.close = AsyncMock()
+    # Context-options helper that the adapter uses for the `context` path
+    # (no return shape needed beyond "a dict that splats into nats.connect").
+    mod.load_context_options = MagicMock(return_value={"servers": ["nats://stub:4222"]})
 
-    # Agent / PromptStream — support `await agent.start()` / `.stop()` usage.
-    mod.Agent = MagicMock()
-    mod.Agent.return_value.start = AsyncMock()
-    mod.Agent.return_value.stop = AsyncMock()
+    # AgentService / PromptStream — support `await service.start()` / `.stop()` usage.
+    mod.AgentService = MagicMock()
+    mod.AgentService.return_value.start = AsyncMock()
+    mod.AgentService.return_value.stop = AsyncMock()
     mod.PromptStream = MagicMock()
 
-    # Real exception classes so ``except natsagent.QueryTimeout`` works.
+    # Real exception classes so ``except sdk.QueryTimeout`` works.
     mod.QueryTimeout = type("QueryTimeout", (Exception,), {})
     mod.ProtocolError = type("ProtocolError", (Exception,), {})
 
@@ -282,13 +284,29 @@ def _ensure_natsagent_mock() -> None:
     mod.ResponseChunk = _FakeResponseChunk
     mod.StatusChunk = _FakeStatusChunk
 
-    sys.modules["natsagent"] = mod
+    # The adapter imports as ``import synadia_ai.agents as sdk`` — register
+    # both the parent package and the submodule so the dotted import
+    # resolves cleanly inside pytest collection.
+    parent = MagicMock()
+    parent.agents = mod
+    sys.modules["synadia_ai"] = parent
+    sys.modules["synadia_ai.agents"] = mod
+
+    # ``nats`` (nats-py) is the connection factory the adapter calls
+    # directly. Mock it only if the real package isn't installed — most
+    # CI / dev installs have nats-py since it's a transitive dep of
+    # synadia-ai-agents itself.
+    if "nats" not in sys.modules or not hasattr(sys.modules["nats"], "__file__"):
+        nats_mod = MagicMock()
+        nats_mod.connect = AsyncMock()
+        nats_mod.connect.return_value.close = AsyncMock()
+        sys.modules["nats"] = nats_mod
 
 
 # Run at collection time — before any test file's module-level imports.
 _ensure_telegram_mock()
 _ensure_discord_mock()
-_ensure_natsagent_mock()
+_ensure_synadia_agents_mock()
 
 
 # ---------------------------------------------------------------------------

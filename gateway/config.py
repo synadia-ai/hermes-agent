@@ -1597,9 +1597,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     nats_context = os.getenv("NATS_CONTEXT", "").strip()
     nats_agent = os.getenv("HERMES_NATS_AGENT", "").strip()
     nats_owner = os.getenv("HERMES_NATS_OWNER", "").strip()
-    nats_name = os.getenv("HERMES_NATS_NAME", "").strip()
-    nats_session = os.getenv("HERMES_NATS_SESSION", "").strip()
-    if nats_url or nats_context or nats_agent or nats_owner or nats_name or nats_session:
+    nats_session_name = os.getenv("HERMES_NATS_SESSION_NAME", "").strip()
+    if nats_url or nats_context or nats_agent or nats_owner or nats_session_name:
         if Platform.NATS not in config.platforms:
             config.platforms[Platform.NATS] = PlatformConfig()
         config.platforms[Platform.NATS].enabled = True
@@ -1612,10 +1611,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             extra["agent"] = nats_agent
         if nats_owner:
             extra["owner"] = nats_owner
-        if nats_name:
-            extra["name"] = nats_name
-        if nats_session:
-            extra["session_default"] = nats_session
+        if nats_session_name:
+            extra["session_name"] = nats_session_name
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

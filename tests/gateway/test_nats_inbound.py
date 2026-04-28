@@ -19,7 +19,7 @@ Covers, in order of the prompt lifecycle (design doc §6.2):
 * ``send()`` — publishes when a stream is registered, returns a
   descriptive ``SendResult`` when it isn't.
 
-Tests use the conftest ``natsagent`` mock (``ResponseChunk`` and
+Tests use the conftest ``synadia_ai.agents`` mock (``ResponseChunk`` and
 ``StatusChunk`` are simple stand-ins that just record kwargs). The
 ``AIAgent`` construction inside ``_run_agent_sync`` is exercised via
 ``_run_text_prompt`` monkeypatches — we don't spin up a real agent.
@@ -50,7 +50,7 @@ def _valid_extra(**overrides) -> dict:
     base = {
         "servers": ["nats://127.0.0.1:4222"],
         "owner": "rene",
-        "name": "gateway",
+        "session_name": "alice",
         "ack_keepalive_interval_s": 1,  # fast for tests
     }
     base.update(overrides)
@@ -64,10 +64,8 @@ def _build_adapter(**extra_overrides) -> NatsAdapter:
 def _fake_stream(raw: bytes = b"") -> MagicMock:
     """Build a PromptStream-shaped MagicMock.
 
-    ``raw`` is retained for callers that still want to pin the
-    `stream._request.data` attribute (some tests assert against it), but
-    the adapter itself no longer reads it — session now comes off the
-    parsed ``Envelope``.
+    ``raw`` is retained for callers that pin the ``stream._request.data``
+    attribute; the adapter itself no longer reads it.
     """
     stream = MagicMock()
     stream.send = AsyncMock()
@@ -77,29 +75,29 @@ def _fake_stream(raw: bytes = b"") -> MagicMock:
     return stream
 
 
-def _envelope(prompt: str, *, session: Optional[str] = None, attachments=None) -> MagicMock:
+def _envelope(prompt: str, *, attachments=None) -> MagicMock:
     """Build a minimal Envelope-shaped MagicMock for ``_on_prompt`` tests.
 
-    Explicitly pins ``session`` and ``attachments`` so MagicMock's
-    auto-child-attribute behavior doesn't leak truthy junk into the
-    adapter's ``envelope.session or default`` dispatch.
+    v0.3 dropped ``Envelope.session`` — the session is the 5th subject
+    token, resolved from ``settings.session_name``. Tests that need to
+    assert on chat_id should construct the adapter with the matching
+    ``session_name`` kwarg via ``_build_adapter``.
     """
     env = MagicMock()
     env.prompt = prompt
-    env.session = session
     env.attachments = attachments
     return env
 
 
 @pytest.fixture(autouse=True)
-def _fresh_natsagent_mock(monkeypatch):
+def _fresh_synadia_agents_mock(monkeypatch):
     """Reset ResponseChunk / StatusChunk stand-ins between tests.
 
     The conftest planter installs classes with ``__init__`` kwargs; re-use
     them here by verifying they persist, but individual tests set up their
     own send side-effects so no per-test re-planting is needed.
     """
-    return sys.modules["natsagent"]
+    return sys.modules["synadia_ai.agents"]
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +729,7 @@ class TestOnPromptIntegration:
     @pytest.mark.asyncio
     async def test_text_prompt_dispatches_to_text_path(self, monkeypatch):
         adapter = _build_adapter()
-        envelope = _envelope("hello agent", session="alice")
+        envelope = _envelope("hello agent")
         stream = _fake_stream()
 
         text_prompt_calls: list = []
@@ -810,8 +808,8 @@ class TestOnPromptIntegration:
 
     @pytest.mark.asyncio
     async def test_registers_stream_and_cleans_up_on_success(self, monkeypatch):
-        adapter = _build_adapter()
-        envelope = _envelope("hi", session="bob")
+        adapter = _build_adapter(session_name="bob")
+        envelope = _envelope("hi")
         stream = _fake_stream()
 
         observed: dict = {}
@@ -825,8 +823,9 @@ class TestOnPromptIntegration:
 
         await adapter._on_prompt(envelope, stream)
 
-        # T5.0 — the registry is compound-keyed (chat_id, id(stream)) so
-        # overlapping session prompts can coexist. The contextvar is the
+        # The registry is compound-keyed (chat_id, id(stream)) so the
+        # contextvar fallback path (in _resolve_stream) can disambiguate
+        # by id even when chat_id is constant. The contextvar is the
         # race-safe primary lookup; this dict is the diagnostic fallback.
         assert observed["active_streams_during_run"] == {("bob", id(stream)): stream}
         # After the handler returns, the stream must be gone so a later
@@ -836,12 +835,18 @@ class TestOnPromptIntegration:
         assert adapter._in_flight_handlers == set()
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_default_session_when_session_missing(
+    async def test_chat_id_is_settings_session_name_not_envelope_field(
         self, monkeypatch
     ):
-        adapter = _build_adapter(session_default="fallback")
-        # Envelope with no session → adapter falls back to session_default.
+        # v0.3: session is the 5th subject token, fixed at service start
+        # — chat_id always comes from ``settings.session_name``, never
+        # from anything on the envelope. Verify a stray envelope.session
+        # attribute doesn't override the configured token.
+        adapter = _build_adapter(session_name="configured")
         envelope = _envelope("hi")
+        # Even if some legacy caller painted this field, the adapter
+        # must ignore it.
+        envelope.session = "stray-from-caller"
         stream = _fake_stream()
 
         captured: list = []
@@ -852,12 +857,12 @@ class TestOnPromptIntegration:
         monkeypatch.setattr(adapter, "_run_text_prompt", _fake_run)
 
         await adapter._on_prompt(envelope, stream)
-        assert captured == ["fallback"]
+        assert captured == ["configured"]
 
     @pytest.mark.asyncio
     async def test_cleans_up_when_run_text_prompt_raises(self, monkeypatch):
-        adapter = _build_adapter()
-        envelope = _envelope("hi", session="carol")
+        adapter = _build_adapter(session_name="carol")
+        envelope = _envelope("hi")
         stream = _fake_stream()
 
         async def _boom(event, s, chat_id):

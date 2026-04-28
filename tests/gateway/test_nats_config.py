@@ -3,8 +3,8 @@
 Covers :class:`NatsAdapterSettings.from_extra` happy/bad paths, the
 adapter's fatal-error behaviour on bad config, and the env-variable →
 ``config.extra`` round-trip in :func:`_apply_env_overrides`. The
-``_ensure_natsagent_mock`` autouse in ``conftest.py`` installs a mock
-``natsagent`` module so these tests run without the real SDK.
+``_ensure_synadia_agents_mock`` autouse in ``conftest.py`` installs a mock
+``synadia_ai.agents`` module so these tests run without the real SDK.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from gateway.platforms.nats import (
     DEFAULT_ATTACHMENTS_OK,
     DEFAULT_HEARTBEAT_INTERVAL_S,
     DEFAULT_MAX_PAYLOAD,
-    DEFAULT_SESSION_DEFAULT,
     MAX_ACK_KEEPALIVE_INTERVAL_S,
     NatsAdapter,
     NatsAdapterSettings,
@@ -46,7 +45,7 @@ class TestSettingsFromExtraHappy:
             {
                 "servers": ["nats://127.0.0.1:4222"],
                 "owner": "rene",
-                "name": "gateway",
+                "session_name": "default",
             }
         )
 
@@ -54,8 +53,7 @@ class TestSettingsFromExtraHappy:
         assert settings.context is None
         assert settings.agent == DEFAULT_AGENT
         assert settings.owner == "rene"
-        assert settings.name == "gateway"
-        assert settings.session_default == DEFAULT_SESSION_DEFAULT
+        assert settings.session_name == "default"
         assert settings.heartbeat_interval_s == DEFAULT_HEARTBEAT_INTERVAL_S
         assert settings.max_payload == DEFAULT_MAX_PAYLOAD
         assert settings.attachments_ok is DEFAULT_ATTACHMENTS_OK
@@ -66,7 +64,7 @@ class TestSettingsFromExtraHappy:
             {
                 "context": "local-nats",
                 "owner": "rene",
-                "name": "gateway",
+                "session_name": "default",
             }
         )
 
@@ -79,8 +77,7 @@ class TestSettingsFromExtraHappy:
                 "servers": ["nats://a:4222", "nats://b:4222"],
                 "agent": "hermes",
                 "owner": "acme_corp",
-                "name": "prod-1",
-                "session_default": "team",
+                "session_name": "prod-1",
                 "heartbeat_interval_s": 15,
                 "max_payload": "2MB",
                 "attachments_ok": False,
@@ -91,8 +88,7 @@ class TestSettingsFromExtraHappy:
         assert settings.servers == ["nats://a:4222", "nats://b:4222"]
         assert settings.agent == "hermes"
         assert settings.owner == "acme_corp"
-        assert settings.name == "prod-1"
-        assert settings.session_default == "team"
+        assert settings.session_name == "prod-1"
         assert settings.heartbeat_interval_s == 15
         assert settings.max_payload == "2MB"
         assert settings.attachments_ok is False
@@ -103,7 +99,7 @@ class TestSettingsFromExtraHappy:
             {
                 "servers": "nats://127.0.0.1:4222",
                 "owner": "rene",
-                "name": "gateway",
+                "session_name": "default",
             }
         )
         assert settings.servers == ["nats://127.0.0.1:4222"]
@@ -113,21 +109,21 @@ class TestSettingsFromExtraHappy:
             {
                 "servers": ["  nats://a:4222  ", "", "nats://b:4222"],
                 "owner": "rene",
-                "name": "gateway",
+                "session_name": "default",
             }
         )
         assert settings.servers == ["nats://a:4222", "nats://b:4222"]
 
-    def test_identity_property_formats_agent_owner_name(self):
+    def test_identity_property_formats_agent_owner_session_name(self):
         settings = NatsAdapterSettings.from_extra(
             {
                 "servers": ["nats://x:4222"],
                 "agent": "hermes",
                 "owner": "rene",
-                "name": "gateway",
+                "session_name": "default",
             }
         )
-        assert settings.identity == "hermes:rene:gateway"
+        assert settings.identity == "hermes:rene:default"
 
     def test_case_insensitive_max_payload_accepted(self):
         # The §2.1 size grammar is case-insensitive; callers shouldn't have
@@ -136,22 +132,11 @@ class TestSettingsFromExtraHappy:
             {
                 "servers": ["nats://x:4222"],
                 "owner": "rene",
-                "name": "gateway",
+                "session_name": "default",
                 "max_payload": "4gb",
             }
         )
         assert settings.max_payload == "4gb"
-
-    def test_empty_session_default_falls_back_to_default(self):
-        settings = NatsAdapterSettings.from_extra(
-            {
-                "servers": ["nats://x:4222"],
-                "owner": "rene",
-                "name": "gateway",
-                "session_default": "   ",
-            }
-        )
-        assert settings.session_default == DEFAULT_SESSION_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +147,9 @@ class TestSettingsFromExtraHappy:
 class TestSettingsFromExtraBad:
     def test_missing_transport_raises(self):
         with pytest.raises(NatsConfigError, match="exactly one of 'servers'"):
-            NatsAdapterSettings.from_extra({"owner": "rene", "name": "gateway"})
+            NatsAdapterSettings.from_extra(
+                {"owner": "rene", "session_name": "default"}
+            )
 
     def test_both_servers_and_context_raises(self):
         with pytest.raises(NatsConfigError, match="not both"):
@@ -171,7 +158,7 @@ class TestSettingsFromExtraBad:
                     "servers": ["nats://x:4222"],
                     "context": "local-nats",
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                 }
             )
 
@@ -181,7 +168,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["   ", ""],
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                 }
             )
 
@@ -191,7 +178,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": 42,
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                 }
             )
 
@@ -201,7 +188,7 @@ class TestSettingsFromExtraBad:
                 {
                     "context": 123,
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                 }
             )
 
@@ -210,12 +197,12 @@ class TestSettingsFromExtraBad:
             NatsAdapterSettings.from_extra(
                 {
                     "servers": ["nats://x:4222"],
-                    "name": "gateway",
+                    "session_name": "default",
                 }
             )
 
-    def test_missing_name_raises(self):
-        with pytest.raises(NatsConfigError, match="'name' is required"):
+    def test_missing_session_name_raises(self):
+        with pytest.raises(NatsConfigError, match="'session_name' is required"):
             NatsAdapterSettings.from_extra(
                 {
                     "servers": ["nats://x:4222"],
@@ -229,7 +216,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["nats://x:4222"],
                     "owner": 9000,
-                    "name": "gateway",
+                    "session_name": "default",
                 }
             )
 
@@ -242,7 +229,7 @@ class TestSettingsFromExtraBad:
                     "servers": ["nats://x:4222"],
                     "agent": "Hermes_Bot",
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                 }
             )
 
@@ -252,7 +239,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["nats://x:4222"],
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                     "max_payload": "one megabyte",
                 }
             )
@@ -263,7 +250,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["nats://x:4222"],
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                     "attachments_ok": "yes",
                 }
             )
@@ -274,7 +261,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["nats://x:4222"],
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                     "heartbeat_interval_s": 0,
                 }
             )
@@ -287,7 +274,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["nats://x:4222"],
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                     "heartbeat_interval_s": True,
                 }
             )
@@ -298,7 +285,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["nats://x:4222"],
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                     "heartbeat_interval_s": "often",
                 }
             )
@@ -309,7 +296,7 @@ class TestSettingsFromExtraBad:
                 {
                     "servers": ["nats://x:4222"],
                     "owner": "rene",
-                    "name": "gateway",
+                    "session_name": "default",
                     "ack_keepalive_interval_s": MAX_ACK_KEEPALIVE_INTERVAL_S,
                 }
             )
@@ -329,7 +316,7 @@ class TestNatsAdapterInit:
             self._pconfig(
                 servers=["nats://127.0.0.1:4222"],
                 owner="rene",
-                name="gateway",
+                session_name="default",
             )
         )
         assert adapter.has_fatal_error is False
@@ -338,25 +325,25 @@ class TestNatsAdapterInit:
 
     def test_invalid_config_sets_fatal_error_nonretryable(self):
         adapter = NatsAdapter(self._pconfig(owner="rene"))
-        # No servers / context — must fail fast.
+        # No servers / context / session_name — must fail fast.
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_code == "nats_config_error"
         assert adapter.fatal_error_retryable is False
         assert adapter._settings is None
 
-    def test_active_streams_and_agent_fields_are_initialised(self):
-        # Later phases (3, 4) assume these attributes exist regardless
-        # of whether init succeeded — guard against regressions.
+    def test_active_streams_and_service_fields_are_initialised(self):
+        # Phases (3, 4) assume these attributes exist regardless of
+        # whether init succeeded — guard against regressions.
         adapter = NatsAdapter(
             self._pconfig(
                 servers=["nats://x:4222"],
                 owner="rene",
-                name="gateway",
+                session_name="default",
             )
         )
         assert adapter._active_streams == {}
         assert adapter._nc is None
-        assert adapter._agent is None
+        assert adapter._service is None
 
     @pytest.mark.asyncio
     async def test_get_chat_info_shape(self):
@@ -364,7 +351,7 @@ class TestNatsAdapterInit:
             self._pconfig(
                 servers=["nats://x:4222"],
                 owner="rene",
-                name="gateway",
+                session_name="default",
             )
         )
         info = await adapter.get_chat_info("any-session-id")
@@ -380,7 +367,7 @@ class TestNatsAdapterInit:
             self._pconfig(
                 servers=["nats://x:4222"],
                 owner="rene",
-                name="gateway",
+                session_name="default",
             )
         )
         await adapter.disconnect()
@@ -400,8 +387,7 @@ class TestNatsEnvOverrides:
             "NATS_CONTEXT": "",
             "HERMES_NATS_AGENT": "",
             "HERMES_NATS_OWNER": "",
-            "HERMES_NATS_NAME": "",
-            "HERMES_NATS_SESSION": "",
+            "HERMES_NATS_SESSION_NAME": "",
         }
         base.update(overrides)
         return {k: v for k, v in base.items() if v}
@@ -432,8 +418,7 @@ class TestNatsEnvOverrides:
             NATS_URL="nats://127.0.0.1:4222",
             HERMES_NATS_AGENT="hermes",
             HERMES_NATS_OWNER="rene",
-            HERMES_NATS_NAME="gateway",
-            HERMES_NATS_SESSION="team",
+            HERMES_NATS_SESSION_NAME="default",
         )
         with patch.dict(os.environ, env, clear=True):
             _apply_env_overrides(config)
@@ -441,8 +426,7 @@ class TestNatsEnvOverrides:
         extra = config.platforms[Platform.NATS].extra
         assert extra["agent"] == "hermes"
         assert extra["owner"] == "rene"
-        assert extra["name"] == "gateway"
-        assert extra["session_default"] == "team"
+        assert extra["session_name"] == "default"
 
     def test_identity_only_enables_but_stays_disconnected(self):
         # Decision log 2026-04-21: HERMES_NATS_OWNER alone marks the
@@ -473,7 +457,7 @@ class TestNatsConnectedGate:
             platforms={
                 Platform.NATS: PlatformConfig(
                     enabled=True,
-                    extra={"servers": ["nats://x:4222"], "owner": "rene", "name": "gateway"},
+                    extra={"servers": ["nats://x:4222"], "owner": "rene", "session_name": "default"},
                 )
             }
         )
@@ -484,7 +468,7 @@ class TestNatsConnectedGate:
             platforms={
                 Platform.NATS: PlatformConfig(
                     enabled=True,
-                    extra={"context": "local-nats", "owner": "rene", "name": "gateway"},
+                    extra={"context": "local-nats", "owner": "rene", "session_name": "default"},
                 )
             }
         )
@@ -495,7 +479,7 @@ class TestNatsConnectedGate:
             platforms={
                 Platform.NATS: PlatformConfig(
                     enabled=True,
-                    extra={"owner": "rene", "name": "gateway"},
+                    extra={"owner": "rene", "session_name": "default"},
                 )
             }
         )
@@ -506,7 +490,7 @@ class TestNatsConnectedGate:
             platforms={
                 Platform.NATS: PlatformConfig(
                     enabled=False,
-                    extra={"servers": ["nats://x:4222"], "owner": "rene", "name": "gateway"},
+                    extra={"servers": ["nats://x:4222"], "owner": "rene", "session_name": "default"},
                 )
             }
         )
@@ -519,7 +503,7 @@ class TestNatsConnectedGate:
 
 
 def test_check_nats_requirements_reports_sdk_availability():
-    # conftest installs the natsagent mock module before any test runs,
-    # so the requirements check must report True both in CI (no real SDK)
-    # and locally (real SDK installed).
+    # conftest installs the synadia_ai.agents mock module before any test
+    # runs, so the requirements check must report True both in CI (no real
+    # SDK) and locally (real SDK installed).
     assert check_nats_requirements() is True

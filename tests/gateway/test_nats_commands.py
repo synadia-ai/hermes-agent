@@ -64,7 +64,7 @@ def _build_adapter() -> NatsAdapter:
     extra = {
         "servers": ["nats://127.0.0.1:4222"],
         "owner": "rene",
-        "name": "gateway",
+        "session_name": "default",
     }
     return NatsAdapter(PlatformConfig(enabled=True, extra=extra))
 

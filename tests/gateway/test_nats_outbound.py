@@ -3,24 +3,19 @@
 Covers:
 
 * ``send_image_file`` / ``send_document`` / ``send_voice`` / ``send_video``
-  — each wraps the file in an :class:`natsagent.Attachment` and publishes
-  one :class:`ResponseChunk` carrying the caption as ``text`` and the
-  attachment in ``attachments``. Missing paths surface as
+  — each wraps the file in an :class:`synadia_ai.agents.Attachment` and
+  publishes one :class:`ResponseChunk` carrying the caption as ``text``
+  and the attachment in ``attachments``. Missing paths surface as
   ``SendResult(success=False)`` rather than raising.
 * ``send_document`` ``file_name`` override — honors the caller's explicit
   wire-filename instead of ``Path(file_path).name``, which callers use
   when staged files live under a content hash but should reach the
   recipient under their original name.
-* Race-safe lookup (T5.0) — the ``_current_stream`` contextvar resolves
-  to the handler's own stream even when a later prompt overwrites
-  ``_active_streams`` for the same chat_id; send helpers fired from the
-  earlier handler's context still land on the earlier handler's reply
-  subject.
-* Concurrent-``session`` regression test — two overlapping
-  ``_on_prompt`` invocations with the same chat_id each fire send
-  helpers, and each lands on its own stream. This is the T5.0 guard.
+* Race-safe lookup — the ``_current_stream`` contextvar resolves
+  to the handler's own stream; send helpers fired from the
+  handler's context land on that handler's reply subject.
 
-The conftest's ``_ensure_natsagent_mock`` installs a ``_FakeAttachment``
+The conftest's ``_ensure_synadia_agents_mock`` installs a ``_FakeAttachment``
 that records ``filename`` on construction; tests assert on
 ``chunk.attachments[0].filename`` to verify the adapter wrapped the
 file correctly.
@@ -50,7 +45,7 @@ def _valid_extra(**overrides) -> dict:
     base = {
         "servers": ["nats://127.0.0.1:4222"],
         "owner": "rene",
-        "name": "gateway",
+        "session_name": "alice",
         "ack_keepalive_interval_s": 1,
     }
     base.update(overrides)
@@ -325,38 +320,33 @@ class TestResolveStream:
 
 
 class TestConcurrentSameSessionRegression:
-    """Two ``_on_prompt`` calls sharing an ``session`` must each deliver
-    their send to their OWN stream, not the other handler's.
+    """Two ``_on_prompt`` calls must each deliver their send to their OWN
+    stream, not the other handler's.
 
-    Phase 6 follow-up: we now serialize same-session handlers via a
-    per-``chat_id`` ``asyncio.Lock`` so there is never more than one
-    active handler per session at any instant. This test therefore
-    verifies the *serialized* property — handler B only starts when
-    handler A has released the lock — and that after serialization each
-    handler's send lands on its own stream. The earlier "overlap and
-    interleave" variant of this test would deadlock under serialization
-    by design; the race we were guarding against is now structurally
-    impossible.
+    Phase 6 + v0.3: we serialize handlers via a single ``_session_lock``
+    so there is never more than one active handler at any instant
+    (one ``AgentService`` = one ``session_name``). This test verifies the
+    *serialized* property — handler B only starts when handler A has
+    released the lock — and that after serialization each handler's send
+    lands on its own stream.
     """
 
     @pytest.mark.asyncio
-    async def test_two_handlers_one_session_serialize_and_send_to_own_streams(
+    async def test_two_handlers_serialize_and_send_to_own_streams(
         self, monkeypatch, tmp_file
     ):
-        adapter = _build_adapter()
+        adapter = _build_adapter(session_name="shared")
 
-        # Two distinct streams arriving with the same session="shared".
+        # Two distinct streams arriving for the same session_name.
         stream_a = _fake_stream()
         stream_b = _fake_stream()
 
         envelope_a = MagicMock()
         envelope_a.prompt = "prompt A"
         envelope_a.attachments = None
-        envelope_a.session = "shared"
         envelope_b = MagicMock()
         envelope_b.prompt = "prompt B"
         envelope_b.attachments = None
-        envelope_b.session = "shared"
 
         path_a = tmp_file("a.png", b"\x89PNGfakeA")
         path_b = tmp_file("b.png", b"\x89PNGfakeB")
@@ -434,57 +424,6 @@ class TestConcurrentSameSessionRegression:
         # Contextvar is reset on both handlers' exits.
         assert _current_stream.get() is None
 
-    @pytest.mark.asyncio
-    async def test_distinct_sessions_run_in_parallel(
-        self, monkeypatch, tmp_file
-    ):
-        """Serialization is per-``chat_id``, not global — distinct
-        ``session`` values MUST still run concurrently. Guards against
-        an accidental global lock regression.
-        """
-        adapter = _build_adapter()
-
-        stream_a = _fake_stream()
-        stream_b = _fake_stream()
-
-        envelope_a = MagicMock()
-        envelope_a.prompt = "A"
-        envelope_a.attachments = None
-        envelope_a.session = "alice"
-        envelope_b = MagicMock()
-        envelope_b.prompt = "B"
-        envelope_b.attachments = None
-        envelope_b.session = "bob"
-
-        both_inside = asyncio.Event()
-        a_inside = asyncio.Event()
-        b_inside = asyncio.Event()
-
-        async def _run_a(event, s, chat_id):
-            a_inside.set()
-            # Wait for B to also land inside its lock — proves no global
-            # lock is serializing distinct sessions.
-            await asyncio.wait_for(b_inside.wait(), timeout=2.0)
-            both_inside.set()
-
-        async def _run_b(event, s, chat_id):
-            b_inside.set()
-            await asyncio.wait_for(a_inside.wait(), timeout=2.0)
-            both_inside.set()
-
-        dispatch = {id(stream_a): _run_a, id(stream_b): _run_b}
-
-        async def _fake_run(event, s, chat_id):
-            await dispatch[id(s)](event, s, chat_id)
-
-        monkeypatch.setattr(adapter, "_run_text_prompt", _fake_run)
-
-        task_a = asyncio.create_task(adapter._on_prompt(envelope_a, stream_a))
-        task_b = asyncio.create_task(adapter._on_prompt(envelope_b, stream_b))
-
-        await asyncio.wait_for(both_inside.wait(), timeout=2.0)
-        await asyncio.wait_for(task_a, timeout=2.0)
-        await asyncio.wait_for(task_b, timeout=2.0)
 
 
 # ---------------------------------------------------------------------------

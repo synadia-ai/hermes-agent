@@ -1,17 +1,18 @@
 """NATS gateway adapter.
 
-Registers one ``natsagent.Agent`` at ``agents.<agent>.<owner>.<name>`` and
-routes inbound NATS Agent Protocol v0.2 prompts through the gateway's
-normal ``MessageEvent`` pipeline. Streams responses back chunk-by-chunk
-over the reply subject; the SDK owns terminator + heartbeat emission.
+Registers one ``synadia_ai.agents.AgentService`` at
+``agents.prompt.<agent>.<owner>.<session_name>`` and routes inbound NATS
+Agent Protocol v0.3 prompts through the gateway's normal ``MessageEvent``
+pipeline. Streams responses back chunk-by-chunk over the reply subject;
+the SDK owns terminator + heartbeat + status-endpoint emission.
 
-Protocol spec: ``../nats-agent-sdk-docs/core-protocol.md`` (v0.2).
+Protocol spec: ``../nats-agent-sdk-docs/core-protocol.md`` (v0.3).
 Hermes architectural reference: ``docs/nats-gateway-design.md``.
 
-Phase 4 scope (T4.1–T4.3): full inbound pipeline — session extraction,
-attachment decoding, MessageEvent construction, keep-alive emission,
-adapter-owned AIAgent + streaming delta pump for text prompts, and
-reuse of the gateway's command dispatch for slash commands.
+Single session per service: v0.3 collapses ``name`` and ``session`` into
+a single ``session_name`` token (the 5th subject token). Multi-session
+deployments use Hermes profile isolation — one profile = one
+``AgentService`` = one ``session_name``.
 """
 
 from __future__ import annotations
@@ -30,11 +31,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 try:
-    import natsagent
-    NATSAGENT_AVAILABLE = True
+    import nats
+    import synadia_ai.agents as sdk
+    SYNADIA_AGENTS_AVAILABLE = True
 except ImportError:
-    natsagent = None  # type: ignore[assignment]
-    NATSAGENT_AVAILABLE = False
+    nats = None  # type: ignore[assignment]
+    sdk = None  # type: ignore[assignment]
+    SYNADIA_AGENTS_AVAILABLE = False
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -49,14 +52,13 @@ from gateway.platforms.base import (
 )
 
 if TYPE_CHECKING:
-    from natsagent import Envelope, PromptStream
+    from synadia_ai.agents import Envelope, PromptStream
 
 logger = logging.getLogger(__name__)
 
 
 # Defaults per docs/nats-gateway-design.md §4.
 DEFAULT_AGENT = "hermes"
-DEFAULT_SESSION_DEFAULT = "default"
 DEFAULT_HEARTBEAT_INTERVAL_S = 30
 DEFAULT_MAX_PAYLOAD = "1MB"
 DEFAULT_ATTACHMENTS_OK = True
@@ -87,30 +89,25 @@ _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
 
 # Handler-scoped current stream. Set by ``_on_prompt`` at entry and reset
 # in its ``finally`` block; read by ``send()`` and the ``send_*`` helpers
-# to reach the caller's own reply subject even when two prompts for the
-# same ``envelope.session`` overlap.
-#
-# T5.0 (Phase 5) — this is the race-safe primary lookup. ``_active_streams``
-# is kept as a compound-keyed ``(chat_id, id(stream)) → stream`` dict for
-# diagnostics and for the narrow cases where a send is scheduled outside
-# the handler's context (contextvars don't propagate through
-# ``run_coroutine_threadsafe``). Phase 4's shortcoming #1 only manifested
-# on the dict lookup — so once callers prefer the contextvar, concurrent
-# prompts for the same chat_id land on their own streams regardless of
-# dict state.
+# to reach the caller's own reply subject. With v0.3 the single-session
+# lock prevents overlapping handlers in the first place; the contextvar
+# stays the race-safe primary lookup, with ``_active_streams`` kept for
+# the contextvar-fallback diagnostic path (sends scheduled outside the
+# handler's context — contextvars don't propagate through
+# ``run_coroutine_threadsafe``).
 _current_stream: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
     "nats_current_stream", default=None
 )
 
 
 def check_nats_requirements() -> bool:
-    """Return True iff the ``natsagent`` SDK is importable.
+    """Return True iff the ``synadia_ai.agents`` SDK is importable.
 
     Mirrors the ``check_*_requirements`` predicate every other adapter
     exposes for ``gateway.run._create_adapter`` to short-circuit when the
     dependency is missing.
     """
-    return NATSAGENT_AVAILABLE
+    return SYNADIA_AGENTS_AVAILABLE
 
 
 class NatsConfigError(ValueError):
@@ -134,8 +131,7 @@ class NatsAdapterSettings:
     context: Optional[str]
     agent: str
     owner: str
-    name: str
-    session_default: str
+    session_name: str
     heartbeat_interval_s: int
     max_payload: str
     attachments_ok: bool
@@ -164,17 +160,11 @@ class NatsAdapterSettings:
             field_name="owner",
             pattern=None,
         )
-        name = _require_token(
-            extra.get("name"),
+        session_name = _require_token(
+            extra.get("session_name"),
             default=None,
-            field_name="name",
+            field_name="session_name",
             pattern=None,
-        )
-
-        session_default = _optional_str(
-            extra.get("session_default"),
-            default=DEFAULT_SESSION_DEFAULT,
-            field_name="session_default",
         )
 
         heartbeat_interval_s = _positive_int(
@@ -219,8 +209,7 @@ class NatsAdapterSettings:
             context=context,
             agent=agent,
             owner=owner,
-            name=name,
-            session_default=session_default,
+            session_name=session_name,
             heartbeat_interval_s=heartbeat_interval_s,
             max_payload=max_payload,
             attachments_ok=attachments_ok,
@@ -229,12 +218,12 @@ class NatsAdapterSettings:
 
     @property
     def identity(self) -> str:
-        """Stable lock identity ``{agent}:{owner}:{name}``.
+        """Stable lock identity ``{agent}:{owner}:{session_name}``.
 
         Used by :meth:`NatsAdapter.connect` (Phase 3) to scope the
         ``acquire_scoped_lock`` call per design doc §5.
         """
-        return f"{self.agent}:{self.owner}:{self.name}"
+        return f"{self.agent}:{self.owner}:{self.session_name}"
 
 
 def _parse_transport(extra: Dict[str, Any]) -> tuple[Optional[List[str]], Optional[str]]:
@@ -355,14 +344,15 @@ def _positive_int(value: Any, default: int, field_name: str) -> int:
 
 
 class NatsAdapter(BasePlatformAdapter):
-    """Gateway adapter for the NATS Agent Protocol v0.2.
+    """Gateway adapter for the NATS Agent Protocol v0.3.
 
-    Phase 4 scope — settings parsing, connect/disconnect lifecycle, and
-    the full inbound pipeline: ``_on_prompt`` reads ``envelope.session``,
-    decodes attachments, starts a keep-alive task, dispatches slash
-    commands through the gateway's command registry, and drives text
-    prompts through an adapter-owned ``AIAgent`` with streaming deltas
-    pumped onto the ``PromptStream``.
+    Settings parsing, connect/disconnect lifecycle, and the full inbound
+    pipeline: ``_on_prompt`` resolves ``chat_id`` from
+    ``settings.session_name`` (the 5th subject token), decodes
+    attachments, starts a keep-alive task, dispatches slash commands
+    through the gateway's command registry, and drives text prompts
+    through an adapter-owned ``AIAgent`` with streaming deltas pumped
+    onto the ``PromptStream``.
     """
 
     # NATS publishes each streaming chunk as a fresh ResponseChunk — there
@@ -378,15 +368,16 @@ class NatsAdapter(BasePlatformAdapter):
 
         # Compound-keyed handle registry: ``(chat_id, id(stream)) → stream``.
         # Populated by ``_on_prompt`` on receipt and consulted by
-        # ``send()`` / ``send_*`` helpers. Two prompts arriving with the
-        # same ``envelope.session`` therefore each land on a distinct key rather
-        # than overwriting each other (Phase 4 shortcoming #1 / T5.0).
+        # ``send()`` / ``send_*`` helpers. With v0.3 the chat_id is a
+        # constant for the process (single ``session_name`` per service),
+        # but we keep the compound shape for the contextvar-fallback
+        # diagnostic path noted at the module-level docstring.
         # The primary per-handler lookup is the ``_current_stream``
         # contextvar; this dict covers only the rare "send scheduled
         # outside my handler's context" fallback and diagnostics.
         self._active_streams: Dict[Tuple[str, int], Any] = {}
         self._nc: Optional[Any] = None
-        self._agent: Optional[Any] = None
+        self._service: Optional[Any] = None
         self._settings: Optional[NatsAdapterSettings] = None
 
         # Shutdown signalling for in-flight prompt handlers. ``_on_prompt``
@@ -400,10 +391,13 @@ class NatsAdapter(BasePlatformAdapter):
         self._shutdown_event: asyncio.Event = asyncio.Event()
         self._in_flight_handlers: Set[asyncio.Task] = set()
 
-        # Per-``envelope.session`` serialization. Concurrent ``_on_prompt``
-        # invocations for the same chat_id queue on this lock so only one
-        # handler is active per session at a time. Prevents the
-        # stacking-race documented in the Phase 6 shortcomings:
+        # Single-session serialization. v0.3 collapses ``name`` and
+        # ``session`` into ``session_name``: one ``AgentService`` serves
+        # exactly one session_name (multi-session = multi-profile). So
+        # the per-chat_id Lock dict from v0.2 collapses to a single
+        # process-wide Lock. Concurrent ``_on_prompt`` invocations queue
+        # here so only one handler is active at a time. Prevents the
+        # stacking-races documented in Phase 6:
         #   - ``register_gateway_notify(session_key, cb)`` is per-session
         #     overwrite — without this lock, handler B's notify cb
         #     replaces handler A's (different captured streams), so A's
@@ -412,11 +406,10 @@ class NatsAdapter(BasePlatformAdapter):
         #     ``asyncio.run_coroutine_threadsafe``, so the dict fallback
         #     in ``_resolve_stream`` is ambiguous when multiple
         #     ``(chat_id, *)`` entries exist.
-        # Both concerns vanish when only one handler per chat_id runs at
-        # a time. Distinct chat_ids still run in parallel. The lock dict
-        # grows with every distinct session seen; ``_teardown_handles``
-        # clears it on disconnect so adapter restarts reset the pool.
-        self._session_locks: Dict[str, asyncio.Lock] = {}
+        # Both concerns vanish when only one handler runs at a time.
+        # ``_teardown_handles`` resets the lock on disconnect so adapter
+        # restarts start from a clean slate.
+        self._session_lock: asyncio.Lock = asyncio.Lock()
 
         try:
             self._settings = NatsAdapterSettings.from_extra(config.extra or {})
@@ -433,27 +426,29 @@ class NatsAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Open a NATS connection, register the agent, and start heartbeats.
+        """Open a NATS connection, register the service, and start heartbeats.
 
         Sequence (design doc §9 "Gateway startup"):
-          1. Acquire the machine-local scope lock ``nats:{agent}:{owner}:{name}``
-             (§5) so two profiles on one host can't shadow each other's
-             registrations.
-          2. ``natsagent.connect(servers=... | context=...)`` — the SDK picks
-             the right nats-py auth bundle. We pass through exactly one of
-             ``servers`` / ``context``; :class:`NatsAdapterSettings`
+          1. Acquire the machine-local scope lock
+             ``nats:{agent}:{owner}:{session_name}`` (§5) so two profiles
+             on one host can't shadow each other's registrations.
+          2. Open a NATS client via ``nats.connect(...)`` (the SDK does
+             NOT own connections — callers build the client and hand it
+             to ``AgentService``). For ``servers`` we pass the list
+             directly; for ``context`` we splat
+             ``sdk.load_context_options(name)``. :class:`NatsAdapterSettings`
              already enforced the xor at init time.
-          3. Build the :class:`natsagent.Agent` with the resolved identity
-             and §2.1 endpoint metadata (max_payload, attachments_ok) +
-             §8.2 heartbeat cadence.
+          3. Build the :class:`synadia_ai.agents.AgentService` with the
+             resolved identity and §2.1 endpoint metadata (max_payload,
+             attachments_ok) + §8.2 heartbeat cadence.
           4. Register the prompt handler (`self._on_prompt`) — mandatory
-             per :meth:`natsagent.Agent.start`.
-          5. ``agent.start()`` — registers the NATS micro service,
-             advertises on ``$SRV.*`` discovery subjects, and spawns the
-             heartbeat publisher task.
+             per :meth:`AgentService.start`.
+          5. ``service.start()`` — registers the NATS micro service
+             (prompt + status endpoints), advertises on ``$SRV.*``
+             discovery subjects, and spawns the heartbeat publisher task.
 
         Failures at any step roll back cleanly: the lock is released, any
-        partially-constructed ``_agent``/``_nc`` handles are torn down,
+        partially-constructed ``_service``/``_nc`` handles are torn down,
         and a retryable fatal error is recorded so ``gateway/run.py``
         queues another attempt 30 s later.
         """
@@ -466,10 +461,10 @@ class NatsAdapter(BasePlatformAdapter):
             # Defensive — has_fatal_error should already be True in this
             # case, but guard so later code never dereferences None.
             return False
-        if not NATSAGENT_AVAILABLE or natsagent is None:
+        if not SYNADIA_AGENTS_AVAILABLE or sdk is None:
             self._set_fatal_error(
                 "nats_sdk_missing",
-                "natsagent SDK not installed; run: pip install 'hermes-agent[nats]'",
+                "synadia-ai-agents SDK not installed; run: pip install 'hermes-agent[nats]'",
                 retryable=False,
             )
             return False
@@ -490,39 +485,44 @@ class NatsAdapter(BasePlatformAdapter):
             # ``self._shutdown_event`` start from a clean slate when a
             # previous teardown set it.
             self._shutdown_event.clear()
+            # Fresh single-session lock so a re-connect after a teardown
+            # doesn't inherit a Lock potentially held by a cancelled task.
+            self._session_lock = asyncio.Lock()
 
-            connect_kwargs: Dict[str, Any] = {}
             if settings.servers is not None:
-                # natsagent.connect accepts list[str] directly; copy so the
-                # SDK can't mutate our frozen-dataclass-owned list via
-                # nats-py internals.
-                connect_kwargs["servers"] = list(settings.servers)
-            if settings.context is not None:
-                connect_kwargs["context"] = settings.context
+                # Copy the list so nats-py internals can't mutate our
+                # frozen-dataclass-owned reference.
+                self._nc = await nats.connect(servers=list(settings.servers))
+            else:
+                # Context path — let the SDK translate `nats context`
+                # JSON (creds, JWT, inbox_prefix, etc.) into nats.connect
+                # kwargs. NatsConfigError already guaranteed exactly one
+                # of servers/context is set, so this branch is correct
+                # by construction.
+                self._nc = await nats.connect(
+                    **sdk.load_context_options(settings.context)
+                )
 
-            self._nc = await natsagent.connect(**connect_kwargs)
-
-            self._agent = natsagent.Agent(
+            self._service = sdk.AgentService(
                 agent=settings.agent,
                 owner=settings.owner,
-                name=settings.name,
+                session_name=settings.session_name,
                 nc=self._nc,
                 heartbeat_interval_s=settings.heartbeat_interval_s,
                 max_payload=settings.max_payload,
                 attachments_ok=settings.attachments_ok,
-                session=settings.session_default,
             )
-            self._agent.on_prompt(self._on_prompt)
-            await self._agent.start()
+            self._service.on_prompt(self._on_prompt)
+            await self._service.start()
 
             self._mark_connected()
             logger.info(
-                "[%s] Connected — registered as agents.%s.%s.%s "
+                "[%s] Connected — subscribed at agents.prompt.%s.%s.%s "
                 "(heartbeat=%ss, max_payload=%s, attachments_ok=%s)",
                 self.name,
                 settings.agent,
                 settings.owner,
-                settings.name,
+                settings.session_name,
                 settings.heartbeat_interval_s,
                 settings.max_payload,
                 settings.attachments_ok,
@@ -567,7 +567,7 @@ class NatsAdapter(BasePlatformAdapter):
              we deregister the service or drop the socket. Skipping this
              surfaces ``CancelledError`` / "connection closed" noise from
              handlers that were mid-``stream.send`` when shutdown fires.
-          2. ``agent.stop()`` — deregisters the micro service endpoint
+          2. ``service.stop()`` — deregisters the micro service endpoint
              and stops the heartbeat publisher. Runs while ``nc`` is
              still open so the heartbeat task's final iteration can
              cleanly bail out instead of racing the socket close.
@@ -594,23 +594,22 @@ class NatsAdapter(BasePlatformAdapter):
         # Clear any lingering stream handles so a late send() fails fast
         # rather than publishing onto a socket that's about to close.
         self._active_streams.clear()
-        # Drop the per-session lock pool so a subsequent ``connect()``
-        # starts from a clean slate — Locks held by cancelled tasks
-        # wouldn't release cleanly otherwise and could deadlock a retry.
-        self._session_locks.clear()
+        # ``connect()`` rebuilds ``_session_lock`` from scratch, so a
+        # Lock held by a cancelled task can't deadlock the next attempt
+        # — no explicit reset needed here.
 
-        if self._agent is not None:
+        if self._service is not None:
             try:
-                await self._agent.stop()
+                await self._service.stop()
             except Exception as exc:
                 logger.warning(
-                    "[%s] Error stopping natsagent.Agent: %s",
+                    "[%s] Error stopping AgentService: %s",
                     self.name,
                     exc,
                     exc_info=True,
                 )
             finally:
-                self._agent = None
+                self._service = None
 
         if self._nc is not None:
             try:
@@ -632,23 +631,24 @@ class NatsAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _on_prompt(self, envelope: "Envelope", stream: "PromptStream") -> None:
-        """Per-prompt entry point dispatched by :class:`natsagent.Agent`.
+        """Per-prompt entry point dispatched by :class:`AgentService`.
 
         Sequence (design doc §6.2):
 
-          1. Read ``envelope.session`` → ``chat_id`` (spec §5.1 optional
-             field; falls back to ``session_default`` when unset).
+          1. ``chat_id = settings.session_name`` — v0.3 collapses session
+             into the 5th subject token, which is fixed per service. One
+             service = one session_name (multi-session = multi-profile).
           2. Decode any ``attachments`` into the hermes media cache so the
              downstream agent can read them via local paths (§8.1). Done
              *before* the session lock so attachment errors fail fast
-             without blocking another same-session handler.
+             without blocking another in-flight handler.
           3. Start the keep-alive task BEFORE acquiring the session lock
              — a queued handler still needs to emit acks so the caller
              doesn't timeout waiting its turn (§6.4).
-          4. Acquire the per-``chat_id`` session lock. Queues concurrent
-             same-session handlers so only one runs at a time — which is
-             what eliminates the notify-cb-overwrite + stream-resolution
-             races documented as Phase 6 shortcomings.
+          4. Acquire the single session lock. Queues concurrent handlers
+             so only one runs at a time — which is what eliminates the
+             notify-cb-overwrite + stream-resolution races documented as
+             Phase 6 shortcomings.
           5. Inside the lock: register the stream, build the MessageEvent,
              dispatch. For slash commands, reuse the gateway runner's
              dispatch via ``self._message_handler``. For text prompts,
@@ -663,7 +663,12 @@ class NatsAdapter(BasePlatformAdapter):
         if task is not None:
             self._in_flight_handlers.add(task)
 
-        chat_id = (envelope.session or "").strip() or self._session_default()
+        # v0.3: session is the 5th subject token, not an envelope field.
+        # ``settings.session_name`` is required at config parse time, so
+        # ``_settings`` is always present here — fall back to "default"
+        # only on the test-only path where init failed before settings
+        # were resolved.
+        chat_id = self._settings.session_name if self._settings else "default"
         keepalive_task: Optional[asyncio.Task] = None
         stream_key: Optional[Tuple[str, int]] = None
 
@@ -689,18 +694,16 @@ class NatsAdapter(BasePlatformAdapter):
                 name=f"nats-keepalive-{chat_id}",
             )
 
-            # Per-session serialization. ``setdefault`` is safe on a
-            # single event loop — there's no await between the dict
-            # lookup and the insert, so two coroutines for the same
-            # chat_id can't both insert a fresh Lock. The acquire below
-            # is the yield point; the second handler sees the first's
-            # Lock in the dict and awaits on it.
-            session_lock = self._session_locks.setdefault(chat_id, asyncio.Lock())
-            async with session_lock:
-                # Register under a compound key so overlapping prompts
-                # with the same ``envelope.session`` still don't collide in the
-                # registry — belt-and-braces defense since the lock
-                # should prevent overlap in the first place.
+            # Single-session serialization. v0.3: one service = one
+            # session_name, so all prompts share this lock — only one
+            # handler runs at a time. The acquire below is the yield
+            # point; the second handler awaits the first's release.
+            async with self._session_lock:
+                # Register under a compound key so the diagnostic dict
+                # lookup in ``_resolve_stream`` can distinguish overlapping
+                # streams even though chat_id is constant — id(stream) is
+                # the disambiguator. Belt-and-braces defense since the
+                # lock should prevent overlap in the first place.
                 stream_key = (chat_id, id(stream))
                 self._active_streams[stream_key] = stream
 
@@ -761,22 +764,6 @@ class NatsAdapter(BasePlatformAdapter):
                 # have already called ``clear()`` if cancellation landed
                 # before this finally-block ran.
                 self._in_flight_handlers.discard(task)
-
-    # ------------------------------------------------------------------
-    # Session extraction — §3 / §5.6
-    # ------------------------------------------------------------------
-
-    def _session_default(self) -> str:
-        """Return the fallback session value from settings when the caller
-        omits ``envelope.session``.
-
-        Isolated as a method so the test-only path where ``_settings`` is
-        None (fatal-init adapter) still has a deterministic answer rather
-        than an ``AttributeError``.
-        """
-        if self._settings is not None:
-            return self._settings.session_default
-        return DEFAULT_SESSION_DEFAULT
 
     # ------------------------------------------------------------------
     # Attachment round-trip — §8.1
@@ -999,7 +986,7 @@ class NatsAdapter(BasePlatformAdapter):
         error path.
         """
         interval = self._settings.ack_keepalive_interval_s if self._settings else DEFAULT_ACK_KEEPALIVE_INTERVAL_S
-        chunk_factory = getattr(natsagent, "StatusChunk", None)
+        chunk_factory = getattr(sdk, "StatusChunk", None)
         while True:
             try:
                 await asyncio.sleep(interval)
@@ -1181,7 +1168,7 @@ class NatsAdapter(BasePlatformAdapter):
         ``_run_text_prompt``'s final-text fallback, which raises to the
         SDK.
         """
-        chunk_factory = getattr(natsagent, "ResponseChunk", None)
+        chunk_factory = getattr(sdk, "ResponseChunk", None)
         while True:
             delta = await queue.get()
             if delta is None:
@@ -1367,22 +1354,19 @@ class NatsAdapter(BasePlatformAdapter):
     def _resolve_stream(self, chat_id: str) -> Optional[Any]:
         """Return the PromptStream that ``chat_id`` should publish onto.
 
-        Lookup order (T5.0):
+        Lookup order:
           1. ``_current_stream`` contextvar — set by ``_on_prompt`` and
              inherited by every coroutine / executor thread spawned from
              that handler (``run_in_executor`` and ``asyncio.Task``
              default-copy the parent's context). This is the race-safe
-             path: two concurrent prompts for the same ``envelope.session`` each
-             see their own handler's stream here regardless of which
-             overwrote the other in ``_active_streams``.
+             path: each handler's send always reaches its own stream.
           2. ``_active_streams`` compound-key lookup by ``chat_id`` — the
              fallback for the narrow case where a send is scheduled
              outside the handler's context (e.g. via
              ``asyncio.run_coroutine_threadsafe`` from a worker thread
-             whose context didn't propagate). Returns whichever stream
-             happens to be registered first; ambiguous under concurrent
-             same-``chat_id`` prompts, but the contextvar path handles
-             those before this fallback runs.
+             whose context didn't propagate). With v0.3 the
+             single-session lock ensures only one stream is registered
+             at a time, so this fallback is unambiguous.
         """
         ctx_stream = _current_stream.get()
         if ctx_stream is not None:
@@ -1539,12 +1523,12 @@ class NatsAdapter(BasePlatformAdapter):
                 error=f"{kind} path not found: {file_path}",
             )
 
-        attachment_factory = getattr(natsagent, "Attachment", None)
-        chunk_factory = getattr(natsagent, "ResponseChunk", None)
+        attachment_factory = getattr(sdk, "Attachment", None)
+        chunk_factory = getattr(sdk, "ResponseChunk", None)
         if attachment_factory is None or chunk_factory is None:
             return SendResult(
                 success=False,
-                error="natsagent SDK missing Attachment / ResponseChunk",
+                error="synadia_ai.agents SDK missing Attachment / ResponseChunk",
             )
 
         try:
@@ -1582,7 +1566,7 @@ class NatsAdapter(BasePlatformAdapter):
         lookup is MagicMock-tolerant under test, where the module is
         patched in ``tests/gateway/conftest.py``.
         """
-        chunk_factory = getattr(natsagent, "ResponseChunk", None)
+        chunk_factory = getattr(sdk, "ResponseChunk", None)
         if chunk_factory is None:
             await stream.send(content)
             return
@@ -1605,7 +1589,7 @@ class NatsAdapter(BasePlatformAdapter):
         the caller keeps iterating the prompt's async iterator while this
         handler awaits, so no keep-alive disruption is needed.
 
-        Returns ``None`` on :class:`natsagent.QueryTimeout` or when no
+        Returns ``None`` on :class:`synadia_ai.agents.QueryTimeout` or when no
         active stream can be resolved for ``chat_id``; the base-class
         contract (§7.2 of the design doc) asks adapters to distinguish
         "no answer" from "delivery failed" by raising only on programmer
@@ -1624,7 +1608,7 @@ class NatsAdapter(BasePlatformAdapter):
             )
             return None
 
-        query_timeout_cls = getattr(natsagent, "QueryTimeout", None)
+        query_timeout_cls = getattr(sdk, "QueryTimeout", None)
         try:
             reply = await stream.ask(prompt, timeout=timeout)
         except Exception as exc:
@@ -1667,9 +1651,9 @@ class NatsAdapter(BasePlatformAdapter):
 
         The NATS wire has no richer chat concept — every prompt is a
         direct request/reply, so ``chat_type="dm"`` is always the right
-        answer (design doc §3). The name mirrors the caller-supplied
-        ``envelope.session`` string, which is what ``build_session_key`` uses
-        downstream to key sessions.
+        answer (design doc §3). The name mirrors the configured
+        ``session_name`` (the 5th subject token), which is what
+        ``build_session_key`` uses downstream to key sessions.
         """
         return {"name": chat_id, "type": "dm"}
 

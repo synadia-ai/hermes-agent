@@ -4342,7 +4342,11 @@ class GatewayRunner:
         elif platform == Platform.NATS:
             from gateway.platforms.nats import NatsAdapter, check_nats_requirements
             if not check_nats_requirements():
-                logger.warning("NATS: natsagent not installed. Run: pip install 'hermes-agent[nats]'")
+                logger.warning(
+                    "NATS: synadia-ai-agents not installed. "
+                    "Until PyPI publishes, install with "
+                    "`pip install -e ../synadia-agents/client-sdk/python`"
+                )
                 return None
             return NatsAdapter(config)
 
