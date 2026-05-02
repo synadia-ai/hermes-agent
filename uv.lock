@@ -2089,6 +2089,7 @@ modal = [
     { name = "modal" },
 ]
 nats = [
+    { name = "nkeys" },
     { name = "synadia-ai-agent-service" },
     { name = "synadia-ai-agents" },
 ]
@@ -2207,6 +2208,7 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2.0,<2" },
     { name = "mistralai", marker = "extra == 'mistral'", specifier = ">=2.3.0,<3" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=1.0.0,<2" },
+    { name = "nkeys", marker = "extra == 'nats'", specifier = ">=0.2,<1" },
     { name = "numpy", marker = "extra == 'voice'", specifier = ">=1.24.0,<3" },
     { name = "openai", specifier = ">=2.21.0,<3" },
     { name = "parallel-web", specifier = ">=0.4.2,<1" },
@@ -3313,6 +3315,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/83/f8/51569ac65d696c8ec
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a0/c4/c2971a3ba4c6103a3d10c4b0f24f461ddc027f0f09763220cf35ca1401b3/nest_asyncio-1.6.0-py3-none-any.whl", hash = "sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c", size = 5195, upload-time = "2024-01-21T14:25:17.223Z" },
 ]
+
+[[package]]
+name = "nkeys"
+version = "0.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pynacl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/8d/d17254baea57fe4a7dd1ba89827d3cf0a21106988ec8971a46bfc5239b15/nkeys-0.2.1.tar.gz", hash = "sha256:3a201dcd203d8bb05ba2884d441b2c92918b2a537a10d324e73738887dde9da3", size = 10667, upload-time = "2024-09-11T06:32:09.03Z" }
 
 [[package]]
 name = "nltk"

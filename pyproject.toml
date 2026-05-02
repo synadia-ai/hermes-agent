@@ -93,6 +93,9 @@ google = [
 nats = [
   "synadia-ai-agents>=0.5,<1",
   "synadia-ai-agent-service>=0.1,<1",
+  # nats-py imports nkeys lazily for JWT/.creds auth (NGS, NSC-issued users).
+  # It is NOT a hard dependency of nats-py, so declare it explicitly.
+  "nkeys>=0.2,<1",
 ]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 web = ["fastapi>=0.104.0,<1", "uvicorn[standard]>=0.24.0,<1"]
