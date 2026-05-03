@@ -2237,8 +2237,8 @@ requires-dist = [
     { name = "slack-sdk", marker = "extra == 'messaging'", specifier = ">=3.27.0,<4" },
     { name = "slack-sdk", marker = "extra == 'slack'", specifier = ">=3.27.0,<4" },
     { name = "sounddevice", marker = "extra == 'voice'", specifier = ">=0.4.6,<1" },
-    { name = "synadia-ai-agent-service", marker = "extra == 'nats'", specifier = ">=0.1,<1" },
-    { name = "synadia-ai-agents", marker = "extra == 'nats'", specifier = ">=0.5,<1" },
+    { name = "synadia-ai-agent-service", marker = "extra == 'nats'", specifier = ">=0.2,<1" },
+    { name = "synadia-ai-agents", marker = "extra == 'nats'", specifier = ">=0.6,<1" },
     { name = "tenacity", specifier = ">=9.1.4,<10" },
     { name = "tinker", marker = "extra == 'rl'", git = "https://github.com/thinking-machines-lab/tinker.git?rev=30517b667f18a3dfb7ef33fb56cf686d5820ba2b" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a29,<0.0.22" },
@@ -5174,29 +5174,29 @@ wheels = [
 
 [[package]]
 name = "synadia-ai-agent-service"
-version = "0.1.0"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nats-py" },
     { name = "pydantic" },
     { name = "synadia-ai-agents" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/f2/18054525dd0cb2cd5bfdd788cdf0856c86aec26dba17771cf0118bdd955b/synadia_ai_agent_service-0.1.0.tar.gz", hash = "sha256:907dee82feca9b7e90daa117316814c0caa0de65b06724403cc1c999209af93e", size = 80123, upload-time = "2026-05-01T20:40:10.271Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/f8/be84c99e38405dd166c9db13ce9d46001c0e5315d0f0a2f475114bf01001/synadia_ai_agent_service-0.2.0.tar.gz", hash = "sha256:7cdbcef7d1db38a4b92edec34838b9fe61c77227758626e684f70954542cde51", size = 80458, upload-time = "2026-05-03T23:20:45.84Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2c/99/8930a17c02ba39d2eb82e943a8c80088dd015d68c41fde7a293426581985/synadia_ai_agent_service-0.1.0-py3-none-any.whl", hash = "sha256:bdc5484c2f7d80fba57d5c485748880a2d4cdb01285211d750efb4ed99cd17e3", size = 20038, upload-time = "2026-05-01T20:40:09.052Z" },
+    { url = "https://files.pythonhosted.org/packages/89/ab/b6b1047013ada7cd3db80c5aac704dbc93070e25216c2d7ec38c44b29bd1/synadia_ai_agent_service-0.2.0-py3-none-any.whl", hash = "sha256:b827b37e0219b1485d07f0d263ee343711f90b8ee8b4d7f5ab79211ff1d52ee2", size = 20038, upload-time = "2026-05-03T23:20:44.704Z" },
 ]
 
 [[package]]
 name = "synadia-ai-agents"
-version = "0.5.0"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nats-py" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d3/0d/7b0d043a608edd2aae8f7d2438b8e1d8db897e4797b0649837d84c664583/synadia_ai_agents-0.5.0.tar.gz", hash = "sha256:62e0cec8971a8dd292a295d887c09a1411ab8f945800003ab0a76f26579db749", size = 116698, upload-time = "2026-05-01T19:07:59.696Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8f/4b/b6c3faf5f11c1251de927cbecfd7f53a26cfe42f046dd76d4f5bcb6c3141/synadia_ai_agents-0.6.0.tar.gz", hash = "sha256:fa83e40162c1300c755f48edec3aac153dedb777fb23f8ded4313e7e6b1eb0fb", size = 138200, upload-time = "2026-05-03T23:16:14.217Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/82/69/eb3e42769f2d7a94a8d490dcf644e30341d45a55c1f4cb6e0795db2a78c8/synadia_ai_agents-0.5.0-py3-none-any.whl", hash = "sha256:f38b28609ad00d4316e4d03dcf87d9f3eb88234dfb877950217794d56fefa2dd", size = 44279, upload-time = "2026-05-01T19:07:58.479Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/ea/81c29e3564f01e942b094c8fb63d8347cf1278e1b11641b203973ae97f0c/synadia_ai_agents-0.6.0-py3-none-any.whl", hash = "sha256:3ab8a7f180af97926e4934240f95fbed67b7ae63b8eefccf2b6b860111d971a2", size = 52084, upload-time = "2026-05-03T23:16:12.151Z" },
 ]
 
 [[package]]
