@@ -134,6 +134,7 @@ all = [
   "hermes-agent[mistral]",
   "hermes-agent[bedrock]",
   "hermes-agent[web]",
+  "hermes-agent[nats]",
 ]
 
 [project.scripts]
