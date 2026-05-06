@@ -1592,12 +1592,27 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
 
-    # NATS is config.yaml-only — no env var overrides. Other Hermes platforms
-    # use env vars exclusively for secrets (bot tokens, API keys); NATS has no
-    # secrets to protect (server URL, owner, session_name are all plain
-    # configuration), so env vars would only add a bespoke surface that doesn't
-    # match the rest of the codebase. Configure NATS via `hermes setup gateway`
-    # or by editing `platforms.nats` in config.yaml directly.
+    # NATS
+    nats_url = os.getenv("NATS_URL", "").strip()
+    nats_context = os.getenv("NATS_CONTEXT", "").strip()
+    nats_agent = os.getenv("HERMES_NATS_AGENT", "").strip()
+    nats_owner = os.getenv("HERMES_NATS_OWNER", "").strip()
+    nats_session_name = os.getenv("HERMES_NATS_SESSION_NAME", "").strip()
+    if nats_url or nats_context or nats_agent or nats_owner or nats_session_name:
+        if Platform.NATS not in config.platforms:
+            config.platforms[Platform.NATS] = PlatformConfig()
+        config.platforms[Platform.NATS].enabled = True
+        extra = config.platforms[Platform.NATS].extra
+        if nats_url:
+            extra["servers"] = [nats_url]
+        if nats_context:
+            extra["context"] = nats_context
+        if nats_agent:
+            extra["agent"] = nats_agent
+        if nats_owner:
+            extra["owner"] = nats_owner
+        if nats_session_name:
+            extra["session_name"] = nats_session_name
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

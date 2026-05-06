@@ -404,29 +404,74 @@ class TestNatsAdapterInit:
 
 
 # ---------------------------------------------------------------------------
-# Env vars must NOT configure NATS — config.yaml is canonical
+# Env-variable → config.extra round-trip (complements Phase 1 T1.2)
 # ---------------------------------------------------------------------------
 
 
-class TestNatsIgnoresEnvVars:
-    """NATS does not consume env vars. Other Hermes platforms reserve env
-    vars for secrets only (bot tokens, API keys); NATS has no secrets to
-    protect, so plain configuration belongs in config.yaml. This test pins
-    the contract against accidental re-introduction of env-var parsing.
-    """
-
-    def test_setting_every_nats_envvar_does_nothing(self):
-        config = GatewayConfig()
-        env = {
-            "NATS_URL": "nats://127.0.0.1:4222",
-            "NATS_CONTEXT": "local-nats",
-            "HERMES_NATS_AGENT": "hermes",
-            "HERMES_NATS_OWNER": "rene",
-            "HERMES_NATS_SESSION_NAME": "default",
+class TestNatsEnvOverrides:
+    def _nats_env(self, **overrides: str) -> dict[str, str]:
+        """Build a clean env dict with only NATS_* / HERMES_NATS_* variables."""
+        base = {
+            "NATS_URL": "",
+            "NATS_CONTEXT": "",
+            "HERMES_NATS_AGENT": "",
+            "HERMES_NATS_OWNER": "",
+            "HERMES_NATS_SESSION_NAME": "",
         }
+        base.update(overrides)
+        return {k: v for k, v in base.items() if v}
+
+    def test_nats_url_enables_and_populates_servers(self):
+        config = GatewayConfig()
+        with patch.dict(os.environ, self._nats_env(NATS_URL="nats://127.0.0.1:4222"), clear=True):
+            _apply_env_overrides(config)
+
+        assert Platform.NATS in config.platforms
+        platform_cfg = config.platforms[Platform.NATS]
+        assert platform_cfg.enabled is True
+        assert platform_cfg.extra["servers"] == ["nats://127.0.0.1:4222"]
+
+    def test_nats_context_enables_and_populates_context(self):
+        config = GatewayConfig()
+        with patch.dict(os.environ, self._nats_env(NATS_CONTEXT="local-nats"), clear=True):
+            _apply_env_overrides(config)
+
+        platform_cfg = config.platforms[Platform.NATS]
+        assert platform_cfg.enabled is True
+        assert platform_cfg.extra["context"] == "local-nats"
+        assert "servers" not in platform_cfg.extra
+
+    def test_identity_env_vars_populate_extra(self):
+        config = GatewayConfig()
+        env = self._nats_env(
+            NATS_URL="nats://127.0.0.1:4222",
+            HERMES_NATS_AGENT="hermes",
+            HERMES_NATS_OWNER="rene",
+            HERMES_NATS_SESSION_NAME="default",
+        )
         with patch.dict(os.environ, env, clear=True):
             _apply_env_overrides(config)
 
+        extra = config.platforms[Platform.NATS].extra
+        assert extra["agent"] == "hermes"
+        assert extra["owner"] == "rene"
+        assert extra["session_name"] == "default"
+
+    def test_identity_only_enables_but_stays_disconnected(self):
+        # Decision log 2026-04-21: HERMES_NATS_OWNER alone marks the
+        # platform enabled but lacks transport, so get_connected_platforms
+        # must still filter it out.
+        config = GatewayConfig()
+        with patch.dict(os.environ, self._nats_env(HERMES_NATS_OWNER="rene"), clear=True):
+            _apply_env_overrides(config)
+
+        assert config.platforms[Platform.NATS].enabled is True
+        assert Platform.NATS not in config.get_connected_platforms()
+
+    def test_no_env_vars_leaves_platform_absent(self):
+        config = GatewayConfig()
+        with patch.dict(os.environ, {}, clear=True):
+            _apply_env_overrides(config)
         assert Platform.NATS not in config.platforms
 
 

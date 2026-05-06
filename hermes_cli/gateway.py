@@ -2995,12 +2995,10 @@ _PLATFORMS = [
         # collision check, writes to config.yaml). Dispatched via
         # ``_builtin_setup_fn("nats") -> _setup_nats`` rather than the standard
         # ``vars`` schema, so this entry intentionally has no ``vars`` field.
-        # No ``token_var`` either — NATS is config.yaml-only (see
-        # ``_platform_status`` for the explicit config-yaml status check).
         "key": "nats",
         "label": "NATS",
         "emoji": "🛰️",
-        "token_var": "",
+        "token_var": "HERMES_NATS_OWNER",
     },
 ]
 def _all_platforms() -> list[dict]:
@@ -3116,7 +3114,7 @@ def _platform_status(platform: dict) -> str:
             return "partially configured"
         return "not configured"
     if platform.get("key") == "nats":
-        # NATS is config.yaml-only — no env-var fallback.
+        # NATS settings live in config.yaml under platforms.nats, not .env.
         try:
             from hermes_cli.config import load_config
             cfg = load_config()
@@ -3124,6 +3122,8 @@ def _platform_status(platform: dict) -> str:
                 return "configured"
         except Exception:
             pass
+        if val:
+            return "configured"
         return "not configured"
     if val:
         return "configured"

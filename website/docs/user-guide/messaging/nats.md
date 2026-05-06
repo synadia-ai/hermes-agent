@@ -22,17 +22,19 @@ Use the NATS gateway when you want to reach Hermes programmatically from other s
 
 ## Step 1: Configure the Gateway
 
-NATS is configured exclusively via `config.yaml` — there are no NATS env vars. The fastest path is the interactive wizard:
+### Option A: Environment variables (fastest for local testing)
+
+Add to `~/.hermes/.env`:
 
 ```bash
-hermes setup gateway
+NATS_URL=nats://127.0.0.1:4222
+HERMES_NATS_OWNER=yourname
+HERMES_NATS_SESSION_NAME=default
 ```
 
-Pick **NATS** from the platform checklist and answer the prompts. The wizard writes everything to `~/.hermes/config.yaml` under `platforms.nats` and runs a cross-profile collision check on the `(agent, owner, session_name)` triple.
+Any NATS env var sets `enabled=true` automatically. `HERMES_NATS_AGENT` defaults to `hermes`; override it if you want a different service family name.
 
-### Manual config
-
-If you'd rather edit the file directly:
+### Option B: `config.yaml`
 
 ```yaml
 platforms:
@@ -57,7 +59,7 @@ platforms:
       ack_keepalive_interval_s: 20
 ```
 
-### Using a NATS context
+### Option C: NATS context
 
 If you already manage NATS credentials via `nats context`, set `extra.context` to the context name and omit `servers`:
 
@@ -77,9 +79,9 @@ Protocol v0.3 collapsed `name` and `session` into a single `session_name` token:
 
 ```bash
 hermes -p alice profile create
-hermes -p alice setup gateway    # pick NATS, set session_name=alice
+hermes -p alice setup            # configure HERMES_NATS_SESSION_NAME=alice
 hermes -p bob profile create
-hermes -p bob setup gateway      # pick NATS, set session_name=bob
+hermes -p bob setup              # configure HERMES_NATS_SESSION_NAME=bob
 
 # Each profile gets its own AgentService and its own session_name token.
 ```
