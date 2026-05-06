@@ -89,9 +89,9 @@ To run N sessions on one host, run N profiles:
 
 ```bash
 hermes -p alice profile create
-hermes -p alice setup            # HERMES_NATS_SESSION_NAME=alice
+hermes -p alice setup gateway    # pick NATS, set session_name=alice
 hermes -p bob profile create
-hermes -p bob setup              # HERMES_NATS_SESSION_NAME=bob
+hermes -p bob setup gateway      # pick NATS, set session_name=bob
 ```
 
 Each profile registers its own `AgentService` at a distinct subject (`agents.prompt.hermes.<owner>.alice` vs `agents.prompt.hermes.<owner>.bob`) and acquires its own scoped lock. The platform-lock contract (§5) is unchanged — its identity simply uses `session_name` in place of v0.2's `name` token.
@@ -135,17 +135,11 @@ platforms:
 - `max_payload` parses against the SDK's size grammar (the SDK will crash on construction otherwise).
 - `ack_keepalive_interval_s < 60` (leave headroom under §6.6's recommended 60 s caller inactivity timeout).
 
-### Env var overrides (`_apply_env_overrides()` in `gateway/config.py`)
+### No env vars — config.yaml is canonical
 
-| Env var                    | Overrides                        | Notes                                                      |
-|----------------------------|----------------------------------|------------------------------------------------------------|
-| `NATS_URL`                 | `extra.servers` (single-URL list) | Canonical env name in the NATS ecosystem                   |
-| `NATS_CONTEXT`             | `extra.context`                   | Splatted via `sdk.load_context_options(name)` into `nats.connect` |
-| `HERMES_NATS_AGENT`        | `extra.agent`                     | Optional; rarely overridden                                 |
-| `HERMES_NATS_OWNER`        | `extra.owner`                     | Common in multi-tenant deployments                          |
-| `HERMES_NATS_SESSION_NAME` | `extra.session_name`              | The 5th subject token; required                             |
+NATS is configured exclusively via `config.yaml` (or the `hermes setup gateway` wizard, which writes the same keys). The rest of Hermes reserves env vars for **secrets only** — bot tokens, API keys — and NATS has none to expose, so adding a dedicated env-var surface would be a snowflake against the rest of the codebase. We don't.
 
-Pattern mirrors Signal (`gateway/config.py:926-943`): if the env var is set, ensure the platform entry exists, set `enabled=True`, and `update()` the `extra` dict.
+`tests/gateway/test_nats_config.py::TestNatsIgnoresEnvVars::test_setting_every_nats_envvar_does_nothing` pins this against accidental re-introduction.
 
 ### `get_connected_platforms()` rule
 

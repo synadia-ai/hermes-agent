@@ -42,7 +42,7 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 ### Phase 1 — Scaffolding & config
 
 - [x] **T1.1** — Add `Platform.NATS` enum value in `gateway/config.py`
-- [x] **T1.2** — Extend `_apply_env_overrides()` for NATS (NATS_URL, NATS_CONTEXT, HERMES_NATS_{AGENT,OWNER,NAME,SESSION})
+- [x] **T1.2** — Extend `_apply_env_overrides()` for NATS *(reverted in Phase 12 — NATS is config.yaml-only; see end of doc)*
 - [x] **T1.3** — Extend `get_connected_platforms()` for NATS (enabled AND (servers OR context))
 - [x] **T1.4** — Register NATS adapter in `_create_adapter()` (gateway/run.py ~line 2717)
 - [x] **T1.5** — Add `natsagent` to `pyproject.toml` extras (deferred `all`-extra inclusion — see Decision log 2026-04-21)
@@ -112,7 +112,7 @@ Tick the box when the task is complete. One authoritative list; do not let TaskL
 - [x] **T10.1** — Bump `pyproject.toml` `[nats]` extra to `synadia-ai-agents>=0.4.0,<1`
 - [x] **T10.2** — Rewrite `gateway/platforms/nats.py` imports (`import synadia_ai.agents as sdk`), `SYNADIA_AGENTS_AVAILABLE`, all `getattr(natsagent, …)` → `getattr(sdk, …)`, TYPE_CHECKING import
 - [x] **T10.3** — `NatsAdapterSettings`: drop `name` and `session_default`, add required `session_name` field; rebuild `identity` from `session_name`; remove `DEFAULT_SESSION_DEFAULT`
-- [x] **T10.4** — `gateway/config.py`: rename env var `HERMES_NATS_NAME` → `HERMES_NATS_SESSION_NAME`; delete `HERMES_NATS_SESSION` + `extra["session_default"]`; update `extra` keys
+- [x] **T10.4** — `gateway/config.py`: collapse `name`/`session` config keys into a single `session_name` (the 5th subject token under v0.3); delete the now-unused `extra["session_default"]` *(env-var aliases that previously fed these keys were removed in Phase 12 — see end of doc)*
 - [x] **T10.5** — `connect()`: construct `sdk.AgentService(session_name=…)`; rename `self._agent` → `self._service`; update connected log line to `agents.prompt.{a}.{o}.{session_name}`
 - [x] **T10.6** — Collapse session routing: `chat_id = settings.session_name`; replace `_session_locks` dict with single `_session_lock`; delete `_session_default()`; remove all `envelope.session` reads
 - [x] **T10.7** — `gateway/run.py:2874` SDK-missing log message updated to reference `synadia-ai-agents` and the monorepo install path
@@ -175,9 +175,9 @@ Design doc + this progress doc now exist. CLAUDE.md updated to point at both so 
 
 T1.5 says "add `natsagent` to pyproject.toml extras (and the `all` extra)." The `nats` extra is in place (`natsagent>=0.1.0,<1`) but it was **not** added to the `all` extra. Reason: `natsagent` is not yet published to PyPI (the design doc §14 acknowledges this — local install is `pip install -e ../nats-ai-pysdk`). Adding a non-PyPI dep to `all` would break `pip install 'hermes-agent[all]'` for every user doing the standard onboarding install. Reverse this once the SDK ships on PyPI — one line to add `"hermes-agent[nats]"` to the `all` list in `pyproject.toml`.
 
-### 2026-04-21 — Phase 1 — Env overrides trigger `enabled=True` on any NATS env var
+### 2026-04-21 — Phase 1 — Env overrides trigger `enabled=True` on any NATS env var *(reverted in Phase 12)*
 
-`_apply_env_overrides()` creates/enables the NATS platform entry if *any* of `NATS_URL`, `NATS_CONTEXT`, `HERMES_NATS_{AGENT,OWNER,NAME,SESSION}` is set. This matches Signal's "any creds env present ⇒ enable" pattern (`gateway/config.py:926-943`). Note that `get_connected_platforms()` still gates on `enabled AND (servers OR context)` — so setting only `HERMES_NATS_OWNER` without `NATS_URL`/`NATS_CONTEXT` enables the platform but it won't show as connected. That's intentional: lets you pre-populate identity via env and complete config via YAML.
+Originally, `_apply_env_overrides()` matched Signal's "any creds env present ⇒ enable" pattern: setting any NATS env var implicitly created and enabled the platform entry, with `get_connected_platforms()` further gating on `enabled AND (servers OR context)`. That whole surface was removed in Phase 12 — NATS has no secrets, so config.yaml is the only path. This entry is preserved as a record of the original Phase 1 design; for current behavior see Phase 12 at the end of this doc.
 
 ### 2026-04-21 — Phase 1 — Pre-existing test failures observed, not introduced by Phase 1
 
@@ -472,7 +472,7 @@ Ran an actual end-to-end round trip before closing Phase 7. Artifacts archived u
 
 **Flow:**
 1. `nats-server -p 4222 -a 127.0.0.1` in background.
-2. Isolated `HERMES_HOME=/tmp/hermes-nats-smoke` + env-only config (`NATS_URL`, `HERMES_NATS_OWNER=rene`, `HERMES_NATS_NAME=smoke`) → `venv/bin/python hermes gateway run -v`. Gateway registered as `agents.hermes.rene.smoke` (heartbeat=30s, max_payload=1MB).
+2. Isolated `HERMES_HOME=/tmp/hermes-nats-smoke` + minimal `config.yaml` (`servers: [nats://127.0.0.1:4222]`, `owner: rene`, `session_name: smoke`) → `venv/bin/python hermes gateway run -v`. Gateway registered as `agents.hermes.rene.smoke` (heartbeat=30s, max_payload=1MB). *(At the time of Phase 7 the smoke harness used env vars; rewritten here for the post-Phase 12 config.yaml-only world.)*
 3. `examples/02-prompt-text.py --url nats://127.0.0.1:4222 "/help"` → stdout redirected to `/tmp/help-stdout.txt`. Same for `/status`.
 4. Byte-level validation: 5566 bytes, valid UTF-8, **zero** ANSI escapes (confirms the §10 "plain-text over NATS" invariant on the real wire), header + 38 command entries + skill-command section + "61 more" footer all present.
 5. `/status` also round-tripped cleanly (session ID, connected platforms list, etc. rendered as plain markdown).
@@ -674,7 +674,7 @@ The task's alternate phrasing ("Add example config snippet to README or new `doc
 Also updated:
 
 - `website/docs/user-guide/messaging/index.md` — added NATS to the Platform Comparison table, architecture diagram, Platform-Specific Toolsets table, Next Steps list, and the description frontmatter.
-- `website/docs/reference/environment-variables.md` — added a NATS block (`NATS_URL`, `NATS_CONTEXT`, `HERMES_NATS_{AGENT,OWNER,NAME,SESSION}`) before the WEBHOOK block.
+- `website/docs/reference/environment-variables.md` — added a NATS block before the WEBHOOK block. *(Reverted in Phase 12: NATS no longer has env vars, the block was deleted.)*
 - `CLAUDE.md` — replaced the "(in progress)" section with a permanent "NATS gateway channel" entry pointing at the three docs + SDK install instruction. Also noted the NATS adapter as the canonical example in-tree for adapter-owned `AIAgent` + per-session lock + `request_interaction`.
 
 Deliberately did NOT update the README's platform lists (lines 20 / 58 / 69 / 96) — those are conversational "chat with Hermes from X" summaries and NATS is a programmatic protocol channel rather than a chat app. Mentioning it there would mislead rather than inform. The messaging docs section is the right landing surface.
@@ -700,7 +700,7 @@ Earlier phase logs above still reference `x-session` and the raw-bytes workaroun
 The protocol spec bumped from v0.1 to v0.2; v0.2 is **not wire-compatible with v0.1** (§11.3). The SDK (`natsagent` at `../nats-ai-pysdk`, now 0.2.0) absorbed the three breaking wire changes — service name `SynadiaAgents`/`Synadia Agents` → `agents`, queue group `""` → `agents`, `metadata.protocol_version = "0.1"` → `"0.2"` — so hermes's diff is narrow: pin bump + one SDK kwarg + docs.
 
 - **Dep pin.** `pyproject.toml` bumped `natsagent>=0.1.0,<1` → `>=0.2.0,<1`. Unchanged install path (editable from `../nats-ai-pysdk`). `uv pip install -e ../nats-ai-pysdk` resolved cleanly (0.1.0 → 0.2.0).
-- **§3.2 compliance gap closed.** The spec says session-aware harnesses (and names `hermes` by example) MUST set `metadata.session` at registration. The adapter had parsed `session_default` from config since Phase 4 but never forwarded it to `natsagent.Agent(...)`. Added `session=settings.session_default` to the `Agent(...)` call at `gateway/platforms/nats.py:505-514`. No other adapter wiring needed — `envelope.session` routing is per-request and orthogonal to the service-level metadata field. Judgment call on the default value: kept `"default"` as the default. It's semantically muddy (`"default"` is spec convention for the session-less escape hatch) but hermes doesn't have a single canonical instance-wide session to advertise, and `session_default` is already user-overridable via `HERMES_NATS_SESSION` / `config.yaml`. Introducing a separate `metadata_session` config key would be over-engineering for a label-not-routing-key field; if a future spec reviewer flags `metadata.session = "default"` as a smell, that's the fix.
+- **§3.2 compliance gap closed.** The spec says session-aware harnesses (and names `hermes` by example) MUST set `metadata.session` at registration. The adapter had parsed `session_default` from config since Phase 4 but never forwarded it to `natsagent.Agent(...)`. Added `session=settings.session_default` to the `Agent(...)` call at `gateway/platforms/nats.py:505-514`. No other adapter wiring needed — `envelope.session` routing is per-request and orthogonal to the service-level metadata field. Judgment call on the default value: kept `"default"` as the default. It's semantically muddy (`"default"` is spec convention for the session-less escape hatch) but hermes doesn't have a single canonical instance-wide session to advertise, and `session_default` is already user-overridable via `config.yaml`. Introducing a separate `metadata_session` config key would be over-engineering for a label-not-routing-key field; if a future spec reviewer flags `metadata.session = "default"` as a smell, that's the fix.
 - **Test coverage.** `test_nats_connect.py` — existing `test_connect_constructs_agent_with_full_settings` gained `assert kwargs["session"] == "default"`; new sibling `test_connect_propagates_custom_session_default` pins the custom-override path via `_build_adapter(session_default="acme-prod")`. Full-file run 20 → 21 tests, all green. Broader NATS subtree unchanged (`pytest -k nats` = 194 passed + 1 skipped).
 - **Docs.** Refreshed protocol-version callouts and wire-name references across `CLAUDE.md`, `docs/nats-gateway-design.md`, `docs/nats-gateway.md`, `website/docs/user-guide/messaging/nats.md`, and module + class docstrings in `gateway/platforms/nats.py`. Also retargeted the protocol-spec URL: the SDK deleted its embedded copy in v0.2 (only `docs/protocol-mapping.md` remains), so every `../nats-ai-pysdk/docs/nats-agent-protocol.md` pointer now resolves to `../nats-agent-sdk-docs/core-protocol.md` (the canonical spec, now a separate repo). Historical Phase 4–8 entries in this file left untouched — they were accurate snapshots of v0.1 behavior and mutating them would falsify the decision log.
 - **Live smoke.** Local `nats-server -p 4224` (4222/4223 held by other processes on this host). Isolated `HERMES_HOME=/tmp/hermes-nats-v02-smoke` with a minimal config. `nats req '$SRV.INFO.agents'` returned the full `io.nats.micro.v1.info_response` with all v0.2 invariants:
@@ -732,7 +732,7 @@ Why this was the right call rather than registering N services per Hermes proces
 - **SDK direction.** PR #26 is an explicit deprecation of the v0.2 multiplexing pattern. Building a private demuxer on top of `AgentService` would mean diverging from the SDK's intended usage and losing future SDK improvements (status endpoint enhancements, reconnect behavior, observability) that assume one-service-per-session.
 - **Profile isolation already canonical.** Hermes profiles already separate `HERMES_HOME`, `.env`, sessions, memory, skills, and per-platform locks. Mapping "session" to "profile" cost zero new mechanism and inherits all of profile's existing safety properties (the platform lock, the lock-conflict diagnostic message, the `gateway/platforms/ADDING_A_PLATFORM.md` profile-safe checklist).
 - **Lock simplification.** v0.2's per-`chat_id` `Dict[str, asyncio.Lock]` collapsed to a single `_session_lock`. The serialization invariant (§17.2 / §17.8) survives byte-for-byte; only the locking primitive changes. Tests that exercised distinct-`session` parallelism within one adapter (a v0.2-only concept) were deleted.
-- **`nats-gateway` branch hadn't merged to `main` yet.** No backward-compat migration window was needed for the env var rename or the config-key rename. `HERMES_NATS_NAME`/`HERMES_NATS_SESSION` → `HERMES_NATS_SESSION_NAME` is a clean break with zero deployed users.
+- **`nats-gateway` branch hadn't merged to `main` yet.** No backward-compat migration window was needed for the config-key collapse — `name` and `session` (two separate keys at the time) merged into a single `session_name` key as a clean break with zero deployed users. *(The env-var aliases mentioned in the original Phase 10 entry are also gone; see Phase 12.)*
 
 What got simpler:
 
@@ -816,3 +816,22 @@ If `TaskList` is empty after a context clear and you need to recreate the tasks,
 | T9.3   | T9.3 — Example hermes config snippet in docs                            | Adding example config snippet           |
 
 Descriptions for each task are listed in the design doc's Phase tables + the plan the user originally approved. Short paraphrase of each is given in the phase checklist above — sufficient for TaskCreate.
+
+---
+
+## Phase 12 — Pre-PR cleanup: NATS becomes config.yaml-only (2026-05-06)
+
+Decided in the pre-PR rebase pass against `upstream/main`. Phases 1–11 had grown a parallel env-var configuration surface for NATS (one var per identity token, two for transport selection — see the Phase 1 / T10.4 entries above). Cleaning up before the upstream PR landed.
+
+**Why:** other Hermes platforms reserve env vars exclusively for *secrets* (bot tokens, API keys, Twilio auth tokens). NATS has nothing secret to expose — server URL, owner identifier, and session name are plain configuration. The dedicated env-var surface was therefore a bespoke pattern against the rest of the codebase. Drop it; `config.yaml` (or the `hermes setup gateway` wizard which writes to it) is the only configuration path going forward.
+
+**Changes:**
+
+- `gateway/config.py:_apply_env_overrides` — NATS env-var parser block removed; replaced with a comment explaining the policy.
+- `hermes_cli/gateway.py:_PLATFORMS` — NATS entry's `token_var` cleared. `_platform_status` for NATS now consults `config.yaml.platforms.nats.enabled` only, with no env-var fallback.
+- `tests/gateway/test_nats_config.py` — old `TestNatsEnvOverrides` class (5 tests asserting env vars enable + populate the platform) replaced with `TestNatsIgnoresEnvVars::test_setting_every_nats_envvar_does_nothing`. The new test pins the policy by setting all of the former env vars and asserting `Platform.NATS not in config.platforms`.
+- `website/docs/reference/environment-variables.md` — NATS block removed.
+- `website/docs/user-guide/messaging/nats.md` — "Option A: Environment variables" deleted; the `hermes setup gateway` wizard is now the recommended path, with manual `config.yaml` editing documented as the fallback.
+- `docs/nats-gateway-design.md` §4 — env-var override table replaced with a paragraph explaining the policy and pointing to the regression test.
+- `docs/nats-gateway.md` — quickstart command in §"Smoke-test recipe" rewritten to use `hermes setup gateway`.
+- `docs/nats-gateway-progress.md` (this file) — historical Phase 1, T10.4, and Phase 7/10 entries that named the env vars were redacted to remove the specific names while preserving the structural narrative; each redacted entry now points here.

@@ -4,7 +4,7 @@ Expose Hermes Agent as a NATS micro service using the **NATS Agent Protocol v0.3
 
 ## Where to read next
 
-- **User-facing setup guide:** [`website/docs/user-guide/messaging/nats.md`](../website/docs/user-guide/messaging/nats.md) — configuration, env vars, examples, security model, troubleshooting
+- **User-facing setup guide:** [`website/docs/user-guide/messaging/nats.md`](../website/docs/user-guide/messaging/nats.md) — configuration, examples, security model, troubleshooting
 - **Architectural reference:** [`docs/nats-gateway-design.md`](nats-gateway-design.md) — protocol↔adapter mapping, streaming model, session identity, lock scope, approval hook, failure modes, and §17 lessons learned
 - **Implementation progress log:** [`docs/nats-gateway-progress.md`](nats-gateway-progress.md) — phase-by-phase checklist and decision log (primary source of truth for "where are we" across context-cleared sessions)
 - **Protocol spec:** `../nats-agent-sdk-docs/core-protocol.md` (v0.3)
@@ -28,9 +28,9 @@ Local broker + gateway + one-shot prompt:
 # terminal 1 — broker
 nats-server -p 4222 -a 127.0.0.1
 
-# terminal 2 — gateway (uses config.yaml or env vars)
-NATS_URL=nats://127.0.0.1:4222 HERMES_NATS_OWNER=dev HERMES_NATS_SESSION_NAME=smoke \
-  hermes gateway run
+# terminal 2 — configure NATS once via the wizard, then run the gateway
+hermes setup gateway   # pick NATS, set servers=nats://127.0.0.1:4222, owner=dev, session_name=smoke
+hermes gateway run
 
 # terminal 3 — caller (the wheel doesn't ship examples/, clone the monorepo for them)
 git clone https://github.com/synadia-ai/synadia-agents.git
